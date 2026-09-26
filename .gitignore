@@ -1,0 +1,17 @@
+# Python のバイトコード
+__pycache__/
+*.py[cod]
+
+# 仮想環境
+.venv/
+venv/
+
+# KomaSagashi が画像フォルダ直下に作る索引 DB（テスト用の画像をここに置いた場合に備えて）
+_画像テキスト検索.db
+_画像テキスト検索.db-journal
+
+# エディタ・OS が作るファイル
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
