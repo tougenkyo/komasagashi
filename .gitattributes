@@ -1,0 +1,6 @@
+# テキストファイルはリポジトリ内では LF で統一する。
+* text=auto
+
+# バッチファイルは CRLF でないと cmd で goto やラベルが誤動作するため、
+# git clone でも GitHub の「Download ZIP」でも CRLF で取り出されるよう固定する。
+*.bat text eol=crlf

@@ -1,0 +1,14 @@
+# 任意機能: 横書きのページ（目次・扉・説明文など）を PaddleOCR で読み直す
+#
+# setup.bat の途中で「追加しますか？」に Y と答えると入る（本体とモデルで約 550 MB）。
+# 手動で入れる場合は、requirements.txt を入れた後に:
+#   pip install -r requirements-paddle.txt
+# CPU で動かす（GPU 版は torch と別の CUDA 環境が要るため使わない）。
+# モデル（PP-OCRv6 small 約 30 MB / medium 約 130 MB）は初回の使用時に自動でダウンロードされる。
+
+# 3.3.1 / 3.7.0 で動作確認。
+paddlepaddle>=3.3,<4
+paddleocr>=3.7,<4
+
+# PaddleOCR を入れても numpy 2 にならないようにする（mokuro が numpy 2 では動かない）。
+numpy>=1.24,<2
