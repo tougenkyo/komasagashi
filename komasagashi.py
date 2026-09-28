@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.05"
+__version__ = "1.06"
 
 import hashlib
 import importlib.util
@@ -90,6 +90,11 @@ APP_DIR   = Path(__file__).resolve().parent
 DATA_DIR  = Path(os.environ.get("KOMASAGASHI_DATA_DIR") or APP_DIR / "data")
 INDEX_DIR = DATA_DIR / "indexes"
 TMP_DIR   = DATA_DIR / "tmp"   # 書庫から一時的に取り出した画像（読み終えたら・終了時に消す）
+MODELS_DIR = DATA_DIR / "models"   # OCR のモデル（ユーザーフォルダの共用キャッシュを使わない）
+# ライブラリがモデルを置く場所。transformers などを読み込む前に決める必要がある。
+os.environ["HF_HOME"] = str(MODELS_DIR / "huggingface")            # manga-ocr（transformers）
+os.environ["PADDLE_PDX_CACHE_HOME"] = str(MODELS_DIR / "paddlex")  # PaddleOCR
+os.environ["TORCH_HOME"] = str(MODELS_DIR / "torch")
 _LEGACY_DB_FILENAME = "_画像テキスト検索.db"   # 旧版は対象フォルダ直下に置いていた
 _SCHEMA_VERSION         = "4"     # 2: 吹き出しの位置 / 3: OCR エンジン・横書き率・正規化文字列 / 4: 書庫内画像の sig
 _NORM_VERSION           = "1"     # fold_text() を変えたら上げる（norm 列を作り直す）
@@ -1101,6 +1106,26 @@ def _patch_numpy_compat() -> None:
             setattr(numpy, name, value)
 
 
+def _use_local_mokuro_cache() -> None:
+    """
+    mokuro は文字位置検出のモデルを ~/.cache/manga-ocr に置く（読み込んだ時点でフォルダも作る）。
+    data/models/manga-ocr を使うように切り替え、読み込みで作られた空のフォルダは消す。
+    """
+    try:
+        import mokuro.cache as mokuro_cache
+    except ImportError:
+        return
+    default = Path(mokuro_cache.cache.root)
+    local = MODELS_DIR / "manga-ocr"
+    local.mkdir(parents=True, exist_ok=True)
+    mokuro_cache.cache.root = local
+    try:
+        if default != local and default.is_dir() and not any(default.iterdir()):
+            default.rmdir()   # ほかのツールのモデルが入っていれば消さない
+    except OSError:
+        pass
+
+
 class MokuroEngine:
     """mokuro の MangaPageOcr（comic-text-detector + manga-ocr-base）を使う OCR。"""
 
@@ -1125,6 +1150,7 @@ class MokuroEngine:
             else:
                 hint = f"mokuro の読み込みに失敗しました（{type(exc).__name__}: {exc}）"
             raise RuntimeError(hint) from exc
+        _use_local_mokuro_cache()
 
         force_cpu = not torch.cuda.is_available()
         if torch.cuda.is_available():
@@ -1235,7 +1261,11 @@ class PaddleEngine:
                  "--paddle-worker", self.model],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                 cwd=str(APP_DIR), creationflags=flags,
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                # paddle は設定に関係なくホームフォルダに .cache\paddle などを作るので、
+                # 子プロセスのホームフォルダを data\models の中に向ける
+                env={**os.environ, "PYTHONIOENCODING": "utf-8",
+                     "USERPROFILE": str(MODELS_DIR / "paddle_home"),
+                     "HOME": str(MODELS_DIR / "paddle_home")})
         finally:
             log.close()   # 子プロセスが自分の分を持っている
         reply = self._receive()

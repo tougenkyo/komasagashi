@@ -192,6 +192,8 @@ OCR した文字をファイルに書き出せます。
 KomaSagashi\
 └─ data\
    ├─ indexes\       … 対象フォルダごとの索引（「フォルダ名_英数字.db」）
+   ├─ models\        … OCR のモデル（初回に自動でダウンロード。約 1 GB、PaddleOCR を使うと +約 170 MB）
+   ├─ logs\          … PaddleOCR の動作ログ
    └─ settings.json  … 記憶したフォルダ・出力倍率などの設定
 ```
 
@@ -262,15 +264,17 @@ pip install "numpy>=1.24,<2"
 
 ## アンインストール
 
-KomaSagashi のフォルダ（`.venv` と `data` を含む）を削除してください。索引と設定もこの中にあります。
+KomaSagashi のフォルダ（`.venv` と `data` を含む）を削除するだけです。
+索引・設定・OCR のモデル（v1.06 以降）はすべてこの中にあり、ユーザーフォルダには何も残しません。
 
-OCR のモデルは、各ライブラリの仕様でユーザーフォルダに保存されています。不要なら次のフォルダも削除してください。
+v1.05 以前を使っていた場合は、OCR のモデルが次の場所にもあります。
+ほかのツール（manga-ocr や mokuro を使うもの）が使っていなければ削除できます。
 
 | フォルダ | 中身 | 目安 |
 |---|---|---|
 | `%USERPROFILE%\.cache\huggingface\hub\models--kha-white--manga-ocr-base` | manga-ocr のモデル | 約 850 MB |
 | `%USERPROFILE%\.cache\manga-ocr` | 文字の位置を検出するモデル | 約 80 MB |
-| `%USERPROFILE%\.paddlex` | PaddleOCR のモデル（入れた場合） | 約 30〜130 MB |
+| `%USERPROFILE%\.paddlex` | PaddleOCR のモデル（入れた場合） | 約 30〜170 MB |
 
 ## 関連プロジェクト
 
