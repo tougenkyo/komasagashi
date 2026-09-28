@@ -25,6 +25,9 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 """
 from __future__ import annotations
 
+# 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
+__version__ = "1.01"
+
 import hashlib
 import importlib.util
 import io
@@ -1220,6 +1223,41 @@ class _WorkerMessage:
     payload: object = None
 
 
+class IndexControl:
+    """
+    インデックス作成の一時停止・停止。画面のボタンから操作し、作業スレッドが 1 枚ごとに確かめる。
+    停止しても登録済みの分は索引に残り、次回は続き（まだ登録していない画像）から処理される。
+    """
+
+    def __init__(self) -> None:
+        self._running = threading.Event()
+        self._running.set()
+        self._stop = threading.Event()
+
+    def pause(self) -> None:
+        self._running.clear()
+
+    def resume(self) -> None:
+        self._running.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._running.set()   # 一時停止中でもすぐ止められるように待ちを解く
+
+    @property
+    def paused(self) -> bool:
+        return not self._running.is_set()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
+    def checkpoint(self) -> bool:
+        """一時停止中なら再開まで待つ。続けてよければ True、停止なら False。"""
+        self._running.wait()
+        return not self._stop.is_set()
+
+
 @dataclass
 class _Job:
     """OCR する画像 1 枚（通常の画像、または書庫内の画像）。"""
@@ -1248,6 +1286,7 @@ class IndexWorker(threading.Thread):
         *,
         max_image_size: int,
         paddle: PaddleEngine | None = None,
+        control: IndexControl | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self._engine         = engine
@@ -1256,6 +1295,7 @@ class IndexWorker(threading.Thread):
         self._q              = msg_queue
         self._max_image_size = max_image_size
         self._paddle         = paddle
+        self._control        = control or IndexControl()
 
     def run(self) -> None:
         try:
@@ -1371,6 +1411,11 @@ class IndexWorker(threading.Thread):
         self._empty_archives = self._index.load_empty_archives()
         self._empty_keep: set[str] = set()
         for p in self._files:
+            if not self._control.checkpoint():
+                # 洗い出しの途中で止めた。どの画像が消えたかは分からないので、削除もしない
+                self._log("■ 停止しました（索引は変更していません）")
+                self._q.put(_WorkerMessage("stopped", str(self._index.count())))
+                return
             rel = str(p.relative_to(root))
             try:
                 st = p.stat()
@@ -1430,10 +1475,14 @@ class IndexWorker(threading.Thread):
 
         start = time.time()
         n_ok = n_err = n_paddle = 0
+        stopped = False
         reader: ArchiveReader | None = None
         reader_error: str | None = None
         try:
             for idx, job in enumerate(jobs, start=1):
+                if not self._control.checkpoint():   # 一時停止中はここで待つ
+                    stopped = True
+                    break
                 self._log(f"[{idx}/{total}] {display_path(job.relpath)}")
                 t0 = time.time()
                 try:
@@ -1469,16 +1518,18 @@ class IndexWorker(threading.Thread):
                 reader.close()
 
         elapsed = time.time() - start
+        done = n_ok + n_err
         self._log(
             f"\n{'=' * 50}\n"
-            f"✅ インデックス更新完了\n"
-            f"OCR 成功: {n_ok} 件（うち PaddleOCR: {n_paddle} 件） / 失敗: {n_err} 件 / "
-            f"スキップ: {skipped} 件\n"
+            + ("■ 停止しました（残りは次回の「インデックス作成/更新」で続きから処理します）\n"
+               if stopped else "✅ インデックス更新完了\n")
+            + f"OCR 成功: {n_ok} 件（うち PaddleOCR: {n_paddle} 件） / 失敗: {n_err} 件 / "
+            f"スキップ: {skipped} 件" + (f" / 未処理: {total - done} 件" if stopped else "") + "\n"
             f"インデックス総数: {self._index.count()} 件\n"
             f"処理時間: {_format_elapsed(elapsed)}"
-            + (f" (平均 {elapsed / total:.1f}秒/枚)" if total else "")
+            + (f" (平均 {elapsed / done:.1f}秒/枚)" if done else "")
         )
-        self._q.put(_WorkerMessage("done", str(self._index.count())))
+        self._q.put(_WorkerMessage("stopped" if stopped else "done", str(self._index.count())))
 
     def _recognize(self, job: "_Job", image: Image.Image) -> tuple[PageText | None, int]:
         """mokuro で読み、横書きのページなら PaddleOCR で読み直す。(結果, PaddleOCR を使ったか)"""
@@ -1968,7 +2019,7 @@ class ImageSearchApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self._root = root
-        self._root.title("KomaSagashi - 画像テキスト検索 (mokuro / manga-ocr-base)")
+        self._root.title(f"KomaSagashi v{__version__} - 画像テキスト検索")
         self._root.geometry("1100x820")
 
         self._engine        = MokuroEngine()
@@ -1977,6 +2028,8 @@ class ImageSearchApp:
         self._msg_queue: "queue.Queue[_WorkerMessage]" = queue.Queue()
         self._is_processing = False
         self._indexing_folder: Path | None = None
+        self._control = IndexControl()           # インデックス作成の一時停止・停止
+        self._paused_at: float | None = None     # 一時停止した時刻（経過時間から除くため）
         self._migrated_note = ""
         self._timer_id: str | None = None
         self._process_start = 0.0
@@ -2034,13 +2087,15 @@ class ImageSearchApp:
         ttk.Checkbutton(f, text="サブフォルダも含める",
                         variable=self._recursive_var).grid(
             row=0, column=0, columnspan=3, padx=4, pady=4, sticky="w")
-        ttk.Label(f, text="画像リサイズ上限 (px):").grid(
-            row=1, column=0, padx=4, pady=4, sticky="w")
+        # 1 行ずつ横に並べる（grid の列にすると、幅の広い下の行に合わせて隙間が空く）
+        size_row = ttk.Frame(f)
+        size_row.grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(size_row, text="画像リサイズ上限 (px):").pack(side="left", padx=4, pady=4)
         self._max_image_size_var = tk.StringVar(value=str(_DEFAULT_MAX_IMAGE_SIZE))
-        ttk.Entry(f, textvariable=self._max_image_size_var, width=8).grid(
-            row=1, column=1, padx=4, pady=4, sticky="w")
-        ttk.Label(f, text="0 = 原寸で処理", foreground="gray").grid(
-            row=1, column=2, padx=4, sticky="w")
+        ttk.Entry(size_row, textvariable=self._max_image_size_var, width=8).pack(
+            side="left", padx=4, pady=4)
+        ttk.Label(size_row, text="0 = 原寸で処理（おすすめは 1500。小さい文字が多いときは 0）",
+                  foreground="gray").pack(side="left", padx=4)
 
         # 任意: 横書きのページ（目次・扉・説明文など）を PaddleOCR で読み直す
         paddle_row = ttk.Frame(f)
@@ -2077,6 +2132,13 @@ class ImageSearchApp:
             side="left", padx=(6, 0))
         self._run_btn = ttk.Button(f, text="▶ インデックス作成/更新", command=self._run_index)
         self._run_btn.pack(side="left", padx=6)
+        # 作成中だけ押せる。停止しても登録済みの分は残り、次回は続きから処理する。
+        self._pause_btn = ttk.Button(f, text="⏸ 一時停止", command=self._toggle_pause,
+                                     state="disabled")
+        self._pause_btn.pack(side="left", padx=2)
+        self._stop_btn = ttk.Button(f, text="■ 停止", command=self._stop_index,
+                                    state="disabled")
+        self._stop_btn.pack(side="left", padx=2)
 
         f = ttk.LabelFrame(tab, text="ログ")
         f.pack(fill="both", expand=True, padx=8, pady=4)
@@ -2295,7 +2357,9 @@ class ImageSearchApp:
         self._refresh_index_status()   # 旧版の索引が画像フォルダ内にあれば、ここで data/ へ移す
         self._is_processing = True
         self._indexing_folder = folder
-        self._run_btn.state(["disabled"])
+        self._control = IndexControl()
+        self._paused_at: float | None = None
+        self._set_running(True)
         self._progress["value"] = 0
         self._elapsed_var.set("00:00")
         self._log_text.config(state="normal")
@@ -2307,19 +2371,54 @@ class ImageSearchApp:
 
         threading.Thread(
             target=self._load_and_index,
-            args=(folder, self._recursive_var.get(), max_image_size, self._selected_paddle()),
+            args=(folder, self._recursive_var.get(), max_image_size, self._selected_paddle(),
+                  self._control),
             daemon=True,
         ).start()
         self._root.after(self._POLL_MS, self._poll_queue)
 
+    def _set_running(self, running: bool) -> None:
+        self._run_btn.state(["disabled"] if running else ["!disabled"])
+        for btn in (self._pause_btn, self._stop_btn):
+            btn.state(["!disabled"] if running else ["disabled"])
+        self._pause_btn.config(text="⏸ 一時停止")
+
+    def _toggle_pause(self) -> None:
+        if not self._is_processing or self._control.stopped:
+            return
+        if self._control.paused:
+            self._control.resume()
+            if self._paused_at is not None:   # 止めていた時間は経過時間に数えない
+                self._process_start += time.time() - self._paused_at
+                self._paused_at = None
+            self._pause_btn.config(text="⏸ 一時停止")
+            self._append_log("▶ 再開します")
+        else:
+            self._control.pause()
+            self._paused_at = time.time()
+            self._pause_btn.config(text="▶ 再開")
+            self._append_log("⏸ 一時停止します（処理中の 1 枚が終わったところで止まります）")
+
+    def _stop_index(self) -> None:
+        if not self._is_processing or self._control.stopped:
+            return
+        self._control.stop()
+        if self._paused_at is not None:
+            self._process_start += time.time() - self._paused_at
+            self._paused_at = None
+        self._pause_btn.state(["disabled"])
+        self._stop_btn.state(["disabled"])
+        self._append_log("■ 停止します（処理中の 1 枚が終わったところで止まります）")
+
     def _tick_elapsed(self) -> None:
         if not self._is_processing:
             return
-        self._elapsed_var.set(_format_elapsed(time.time() - self._process_start))
+        if self._paused_at is None:
+            self._elapsed_var.set(_format_elapsed(time.time() - self._process_start))
         self._timer_id = self._root.after(1000, self._tick_elapsed)
 
     def _load_and_index(self, folder: Path, recursive: bool, max_image_size: int,
-                        paddle: PaddleEngine | None) -> None:
+                        paddle: PaddleEngine | None, control: "IndexControl") -> None:
         try:
             if not self._engine.is_loaded:
                 self._engine.load(
@@ -2330,7 +2429,7 @@ class ImageSearchApp:
             self._msg_queue.put(_WorkerMessage("error", str(exc)))
             return
         IndexWorker(self._engine, index, files, self._msg_queue,
-                    max_image_size=max_image_size, paddle=paddle).start()
+                    max_image_size=max_image_size, paddle=paddle, control=control).start()
 
     def _selected_paddle(self) -> PaddleEngine | None:
         """① の設定で PaddleOCR を使うなら、そのモデルのエンジン（読み込み済みなら使い回す）。"""
@@ -2356,6 +2455,8 @@ class ImageSearchApp:
                 self._progress["value"]   = cur
             elif msg.kind == "done":
                 still_working = False; self._on_index_done(str(msg.payload))
+            elif msg.kind == "stopped":
+                still_working = False; self._on_index_stopped(str(msg.payload))
             elif msg.kind == "error":
                 still_working = False; self._on_error(str(msg.payload))
         if still_working:
@@ -2372,10 +2473,24 @@ class ImageSearchApp:
             self._root.after_cancel(self._timer_id)
             self._timer_id = None
 
+    def _on_index_stopped(self, count: str) -> None:
+        self._is_processing = False
+        self._stop_timer()
+        self._set_running(False)
+        self._elapsed_var.set(_format_elapsed(time.time() - self._process_start))
+        self._refresh_index_status()
+        if self._indexing_folder is not None and TextIndex(self._indexing_folder).exists():
+            self._settings.add_recent_folder(self._indexing_folder)
+        messagebox.showinfo(
+            "停止しました",
+            f"インデックス作成を停止しました。\n"
+            f"登録済み: {count} 件（ここまでの分は検索できます）\n\n"
+            "もう一度「インデックス作成/更新」を押すと、続きから処理します。")
+
     def _on_index_done(self, count: str) -> None:
         self._is_processing = False
         self._stop_timer()
-        self._run_btn.state(["!disabled"])
+        self._set_running(False)
         self._elapsed_var.set(_format_elapsed(time.time() - self._process_start))
         self._refresh_index_status()
         if self._indexing_folder is not None:
@@ -2390,7 +2505,7 @@ class ImageSearchApp:
     def _on_error(self, error_msg: str) -> None:
         self._is_processing = False
         self._stop_timer()
-        self._run_btn.state(["!disabled"])
+        self._set_running(False)
         self._append_log(f"❌ エラー: {error_msg}")
         messagebox.showerror("エラー", error_msg)
 
@@ -2684,6 +2799,13 @@ class ImageSearchApp:
         return dest
 
     def _on_close(self) -> None:
+        if self._is_processing:
+            if not messagebox.askyesno(
+                    "インデックス作成中",
+                    "インデックス作成中です。停止して終了しますか？\n"
+                    "（登録済みの分は残り、次回は続きから処理します）"):
+                return
+            self._control.stop()
         self._close_preview_archive()
         clean_tmp_dir()   # 取り出した一時ファイル（開いているアプリがあれば消せずに次回起動時に消す）
         self._root.destroy()

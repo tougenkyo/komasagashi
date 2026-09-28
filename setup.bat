@@ -1,5 +1,17 @@
 @echo off
+rem ---- Restart in a new cmd with the UTF-8 code page. Keep this part ASCII only. ----
+rem cmd misreads lines that contain Japanese when the code page is changed (chcp 65001)
+rem in the middle of a running batch file, so switch first and run this file again.
+if "%KOMA_UTF8%"=="1" goto :main
+for /f "tokens=2 delims=:." %%a in ('chcp') do for %%b in (%%a) do set "KOMA_OLDCP=%%b"
 chcp 65001 >nul
+set "KOMA_UTF8=1"
+cmd /c ""%~f0" %*"
+set "KOMA_RC=%errorlevel%"
+if defined KOMA_OLDCP chcp %KOMA_OLDCP% >nul
+exit /b %KOMA_RC%
+
+:main
 setlocal
 cd /d "%~dp0"
 title KomaSagashi セットアップ
