@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.01"
+__version__ = "1.02"
 
 import hashlib
 import importlib.util
@@ -887,12 +887,20 @@ class TextIndex:
             ")"
         )
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-        # 画像が 1 枚も読めなかった書庫（空・壊れている・全部パスワード付き）。
-        # 変わっていなければ次回は開かずに飛ばす。
+        # 書庫ごとの処理状況。書庫ファイルの日時・サイズが同じなら、次回は state に応じて:
+        #   done    … 中の画像を最後まで処理した → 開かずに飛ばす
+        #   pending … 途中で止めた・失敗した画像がある → 開き直して残りを処理する
+        #   empty / error … 読める画像が無い・壊れている → 開かずに飛ばす
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS empty_archives ("
-            "  relpath TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL, note TEXT)"
+            "CREATE TABLE IF NOT EXISTS archives ("
+            "  relpath TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL,"
+            "  state TEXT NOT NULL, note TEXT)"
         )
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "empty_archives" in tables:   # v1.01 の記録を引き継ぐ
+            conn.execute("INSERT OR IGNORE INTO archives "
+                         "SELECT relpath, mtime, size, 'empty', note FROM empty_archives")
+            conn.execute("DROP TABLE empty_archives")
         cols = {row[1] for row in conn.execute("PRAGMA table_info(images)")}
         # 古い索引に列を足す。blocks が NULL の行（schema 1）は次回の更新で OCR し直される。
         for col, sql_type in (("blocks", "TEXT"), ("engine", "TEXT"),
@@ -934,21 +942,23 @@ class TextIndex:
                 (relpath, *values, *values),
             )
 
-    def load_empty_archives(self) -> dict[str, tuple[float, int]]:
+    def load_archives(self) -> dict[str, tuple[float, int, str]]:
+        """{書庫の relpath: (mtime, size, state)}"""
         with self._connect() as conn:
-            rows = conn.execute("SELECT relpath, mtime, size FROM empty_archives").fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
+            rows = conn.execute("SELECT relpath, mtime, size, state FROM archives").fetchall()
+        return {r[0]: (r[1], r[2], r[3]) for r in rows}
 
-    def set_empty_archive(self, relpath: str, mtime: float, size: int, note: str) -> None:
+    def set_archive(self, relpath: str, mtime: float, size: int, state: str,
+                    note: str = "") -> None:
         with self._connect() as conn:
-            conn.execute("INSERT OR REPLACE INTO empty_archives VALUES (?, ?, ?, ?)",
-                         (relpath, mtime, size, note))
+            conn.execute("INSERT OR REPLACE INTO archives VALUES (?, ?, ?, ?, ?)",
+                         (relpath, mtime, size, state, note))
 
-    def forget_empty_archives(self, relpaths: list[str]) -> None:
+    def forget_archives(self, relpaths: list[str]) -> None:
         if not relpaths:
             return
         with self._connect() as conn:
-            conn.executemany("DELETE FROM empty_archives WHERE relpath = ?",
+            conn.executemany("DELETE FROM archives WHERE relpath = ?",
                              [(r,) for r in relpaths])
 
     def update_stats(self, rows: list[tuple[float, int, str]]) -> None:
@@ -1146,11 +1156,17 @@ class PaddleEngine:
     PaddleOCR（PP-OCRv6）で横書きの文字を読む。目次・扉・説明文などの印刷文字に強い。
     任意機能: paddlepaddle と paddleocr が入っていなければ使えない（is_installed）。
     CPU で動かす（GPU 版は torch と別の CUDA 環境が要り、導入が重いため）。
+
+    PaddleOCR は同じプロセスで動かすと Python の処理を長く握り、画面が数秒ずつ固まる。
+    そのため別プロセス（このファイルを --paddle-worker で起動）で動かし、
+    1 行の JSON で画像のパスと結果をやり取りする。優先度を下げて画面の操作を妨げないようにする。
     """
+    _LOG_NAME = "paddle.log"
 
     def __init__(self, model: str) -> None:
         self.model = model
-        self._ocr = None
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -1162,42 +1178,63 @@ class PaddleEngine:
 
     @property
     def is_loaded(self) -> bool:
-        return self._ocr is not None
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def log_path(self) -> Path:
+        return DATA_DIR / "logs" / self._LOG_NAME
 
     def load(self, progress_cb: "Callable[[str], None] | None" = None) -> None:
-        # 共有環境では setuptools と標準の distutils が食い違って paddle の import が失敗することがある
-        if sys.version_info < (3, 12):
-            os.environ.setdefault("SETUPTOOLS_USE_DISTUTILS", "stdlib")
-        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-        _patch_numpy_compat()
+        if self.is_loaded:
+            return
         if progress_cb:
-            progress_cb(f"PaddleOCR（{self.model}）をロード中..."
-                        "（初回はモデルを自動でダウンロードします）")
+            progress_cb(f"PaddleOCR（{self.model}）を起動中..."
+                        "（初回はモデルを自動でダウンロードするため、数分かかることがあります）")
         t0 = time.time()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = open(self.log_path, "w", encoding="utf-8")
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
         try:
-            from paddleocr import PaddleOCR
-            self._ocr = PaddleOCR(
-                text_detection_model_name=f"PP-OCRv6_{self.model}_det",
-                text_recognition_model_name=f"PP-OCRv6_{self.model}_rec",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                enable_mkldnn=False,   # CPU 高速化（oneDNN）は一部のモデルで NotImplementedError になる
-            )
-        except Exception as exc:
-            raise RuntimeError(f"PaddleOCR を読み込めませんでした（{type(exc).__name__}: {exc}）"
-                               ) from exc
+            self._proc = subprocess.Popen(
+                [sys.executable, "-W", "ignore", str(Path(__file__).resolve()),
+                 "--paddle-worker", self.model],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                cwd=str(APP_DIR), creationflags=flags,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        finally:
+            log.close()   # 子プロセスが自分の分を持っている
+        reply = self._receive()
+        if "error" in reply:
+            self.close()
+            raise RuntimeError(f"PaddleOCR を読み込めませんでした（{reply['error']}）")
         if progress_cb:
-            progress_cb(f"PaddleOCR ロード完了 ({time.time() - t0:.1f}秒)")
+            progress_cb(f"PaddleOCR 起動完了 ({time.time() - t0:.1f}秒)")
+
+    def _receive(self) -> dict:
+        line = self._proc.stdout.readline() if self._proc else b""
+        if not line:
+            raise RuntimeError(f"PaddleOCR が止まりました（詳しくは {self.log_path}）")
+        return json.loads(line.decode("utf-8"))
 
     def recognize(self, image: Image.Image) -> PageText:
         """行ごとに読み、同じ高さに並ぶ項目（「第14話」「タイトル…003」など）は 1 行にまとめる。"""
-        if not self.is_loaded:
-            raise RuntimeError("PaddleOCR がロードされていません。")
-        bgr = np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
-        result = self._ocr.predict(bgr)[0]
-        items = [(text, [int(v) for v in box])
-                 for text, box in zip(result["rec_texts"], result["rec_boxes"]) if text.strip()]
+        with self._lock:
+            if not self.is_loaded:
+                self.load()   # 途中で止まっていたら起動し直す
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="paddle_", suffix=".bmp", dir=TMP_DIR)
+            os.close(fd)
+            try:
+                image.convert("RGB").save(tmp)   # 圧縮しない BMP で素早く渡す
+                self._proc.stdin.write((json.dumps({"path": tmp}) + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
+                reply = self._receive()
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+        if "error" in reply:
+            raise RuntimeError(f"PaddleOCR で読めませんでした（{reply['error']}）")
+        items = [(text, [int(v) for v in box]) for text, box in reply["items"] if text.strip()]
 
         rows: list[list[tuple[str, list[int]]]] = []
         for text, box in sorted(items, key=lambda it: (it[1][1] + it[1][3]) / 2):
@@ -1211,6 +1248,64 @@ class PaddleEngine:
         lines = [" ".join(t for t, _b in sorted(row, key=lambda it: it[1][0])) for row in rows]
         blocks = [[*box, text] for text, box in items]
         return PageText("\n".join(lines), blocks, self.name, 1.0)
+
+    def close(self) -> None:
+        """子プロセスを終える（アプリの終了時など）。"""
+        proc, self._proc = self._proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.stdin.close()   # 子プロセスは入力の終わりで終了する
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
+def _paddle_worker_main(model: str) -> int:
+    """
+    PaddleOCR の子プロセス（PaddleEngine が起動する）。
+    標準入力から {"path": 画像} を 1 行ずつ受け取り、{"items": [[文字, [x1, y1, x2, y2]], ...]} を返す。
+    """
+    # ライブラリが標準出力に書く文字がやり取りに混ざらないよう、やり取りは複製した出力で行い、
+    # 標準出力はログ（標準エラー）へ回す
+    reply = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+    def send(obj: dict) -> None:
+        reply.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        reply.flush()
+
+    # 共有環境では setuptools と標準の distutils が食い違って paddle の import が失敗することがある
+    if sys.version_info < (3, 12):
+        os.environ.setdefault("SETUPTOOLS_USE_DISTUTILS", "stdlib")
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    _patch_numpy_compat()
+    try:
+        from paddleocr import PaddleOCR
+        ocr = PaddleOCR(
+            text_detection_model_name=f"PP-OCRv6_{model}_det",
+            text_recognition_model_name=f"PP-OCRv6_{model}_rec",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            enable_mkldnn=False,   # CPU 高速化（oneDNN）は一部のモデルで NotImplementedError になる
+        )
+    except Exception as exc:
+        send({"error": f"{type(exc).__name__}: {exc}"})
+        return 1
+    send({"ready": True})
+    for line in sys.stdin:
+        try:
+            path = json.loads(line)["path"]
+            # cv2.imread は日本語を含むパスを読めないので、バイト列から読む
+            bgr = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+            result = ocr.predict(bgr)[0]
+            send({"items": [[t, [int(v) for v in b]]
+                            for t, b in zip(result["rec_texts"], result["rec_boxes"])]})
+        except Exception as exc:
+            send({"error": f"{type(exc).__name__}: {exc}"})
+    return 0
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1345,16 +1440,17 @@ class IndexWorker(threading.Thread):
         """書庫の中の画像を洗い出す。スキップした枚数を返す。"""
         prefix = rel + _ARCHIVE_SEP
         prev_rows = {r: row for r, row in existing.items() if r.startswith(prefix)}
-        same_file = bool(prev_rows) and all(
-            abs(row.mtime - st.st_mtime) < 1e-6 and row.size == st.st_size
-            for row in prev_rows.values())
-        empty = self._empty_archives.get(rel)
-        if not prev_rows and empty and abs(empty[0] - st.st_mtime) < 1e-6 and empty[1] == st.st_size:
-            self._empty_keep.add(rel)   # 前回、読める画像が無いと分かった書庫（変わっていない）
+        record = self._archives.get(rel)
+        state = (record[2] if record and abs(record[0] - st.st_mtime) < 1e-6
+                 and record[1] == st.st_size else None)   # 書庫が変わっていれば None
+        if state in ("empty", "error") and not prev_rows:
+            self._archive_keep.add(rel)   # 前回、読める画像が無いと分かった書庫（変わっていない）
             return 0
         skipped = 0
-        if same_file:
-            # 書庫ファイルが前回と同じなら開かずに済ませる
+        if state == "done":
+            # 前回最後まで処理した書庫で、変わっていない → 開かずに済ませる。
+            # 途中で止めた書庫（pending）は開き直して、まだ登録していない画像を処理する。
+            self._archive_keep.add(rel)
             for r, row in prev_rows.items():
                 keep.add(r)
                 mode = self._classify(row, True)
@@ -1373,18 +1469,20 @@ class IndexWorker(threading.Thread):
             keep.update(prev_rows)
             if not prev_rows and not getattr(exc, "retry", False):
                 # 壊れているなど。書庫が変わるまでは開き直さない（道具が無いだけなら次回も試す）
-                self._index.set_empty_archive(rel, st.st_mtime, st.st_size, str(exc))
-                self._empty_keep.add(rel)
+                self._index.set_archive(rel, st.st_mtime, st.st_size, "error", str(exc))
+                self._archive_keep.add(rel)
             return len(prev_rows)
         self._n_archives += 1
+        self._archive_keep.add(rel)
         if encrypted:
             self._log(f"⚠ {rel}: パスワード付きの画像 {encrypted} 枚は読めないため飛ばします")
         if not members:
             if not encrypted:
                 self._log(f"ℹ {rel}: 画像が入っていません")
-            self._index.set_empty_archive(rel, st.st_mtime, st.st_size,
-                                          "パスワード付き" if encrypted else "画像なし")
-            self._empty_keep.add(rel)
+            self._index.set_archive(rel, st.st_mtime, st.st_size, "empty",
+                                    "パスワード付き" if encrypted else "画像なし")
+            return 0
+        n_jobs = 0
         for member in members:
             r = prefix + member.name
             keep.add(r)
@@ -1396,7 +1494,25 @@ class IndexWorker(threading.Thread):
                 skipped += 1
             else:
                 jobs.append(_Job(r, path, member.name, prev, mode, st, member.sig))
+                n_jobs += 1
+        if n_jobs:
+            # 処理し終えるまでは pending（途中で止めても、次回は開き直して残りを処理する）
+            self._index.set_archive(rel, st.st_mtime, st.st_size, "pending")
+            self._archive_left[rel] = n_jobs
+        else:
+            self._index.set_archive(rel, st.st_mtime, st.st_size, "done")
         return skipped
+
+    def _archive_job_finished(self, job: _Job, ok: bool) -> None:
+        """書庫内の画像を 1 枚処理した。その書庫の分が全部成功したら done にする。"""
+        rel = split_relpath(job.relpath)[0]
+        if rel not in self._archive_left:
+            return   # done の書庫の読み直し（書庫の状態は変わらない）
+        if not ok:
+            self._archive_failed.add(rel)
+        self._archive_left[rel] -= 1
+        if self._archive_left[rel] == 0 and rel not in self._archive_failed:
+            self._index.set_archive(rel, job.stat.st_mtime, job.stat.st_size, "done")
 
     def _process_all(self) -> None:
         root = self._index.root
@@ -1408,8 +1524,10 @@ class IndexWorker(threading.Thread):
         keep: set[str] = set()
         skipped = 0
         self._upgraded = self._unjudged = self._n_archives = 0
-        self._empty_archives = self._index.load_empty_archives()
-        self._empty_keep: set[str] = set()
+        self._archives = self._index.load_archives()
+        self._archive_keep: set[str] = set()        # 今回も存在する書庫
+        self._archive_left: dict[str, int] = {}     # 書庫 → まだ処理していない画像の数
+        self._archive_failed: set[str] = set()      # 失敗した画像がある書庫（次回も開き直す）
         for p in self._files:
             if not self._control.checkpoint():
                 # 洗い出しの途中で止めた。どの画像が消えたかは分からないので、削除もしない
@@ -1440,9 +1558,8 @@ class IndexWorker(threading.Thread):
             self._index.delete_many(removed)
             self._log(f"🗑 消えた画像 {len(removed)} 件をインデックスから削除しました")
         self._index.update_stats(restat)
-        # 消えた書庫・読めるようになった書庫は「空の書庫」の記録から外す
-        self._index.forget_empty_archives(
-            [r for r in self._empty_archives if r not in self._empty_keep])
+        # 消えた書庫の記録を外す
+        self._index.forget_archives([r for r in self._archives if r not in self._archive_keep])
 
         # 書庫ごとにまとめて処理する（書庫は 1 回だけ開いて展開する）
         jobs.sort(key=lambda j: (_natural_sort_key(str(j.path.relative_to(root))),
@@ -1509,9 +1626,13 @@ class IndexWorker(threading.Thread):
                         n_ok += 1
                         n_paddle += n_used_paddle
                         self._log(f"    ✅ 完了 ({_format_elapsed(time.time() - t0)})")
+                    ok = True
                 except Exception as exc:
                     n_err += 1
+                    ok = False
                     self._log(f"    ⚠ エラー ({_format_elapsed(time.time() - t0)}): {exc}")
+                if job.member is not None:
+                    self._archive_job_finished(job, ok)
                 self._q.put(_WorkerMessage("progress", (idx, total)))
         finally:
             if reader is not None:
@@ -2048,7 +2169,7 @@ class ImageSearchApp:
                               and self._OUTPUT_MIN <= scale <= self._OUTPUT_MAX else 1.0)
 
         self._build_ui()
-        self._restore_last_folder()
+        self._show_start_message()
 
     # ── UI 構築 ───────────────────────────────────────────────────────
 
@@ -2315,17 +2436,19 @@ class ImageSearchApp:
             self._nb.select(1)
             self._query_entry.focus_set()
 
-    def _restore_last_folder(self) -> None:
-        """前回使ったフォルダ（インデックスがあるもの）を開いた状態で起動する。"""
-        recent = self._settings.recent_folders()
-        if recent:
-            self._folder_var.set(recent[0])
-            self._on_folder_changed()
+    def _show_start_message(self) -> None:
+        """起動時は対象フォルダを空欄にし、▼ から前に使ったフォルダを選べることを案内する。"""
+        if self._settings.recent_folders():
+            self._index_status_var.set(
+                "対象フォルダを選んでください（▼ から前にインデックスを作ったフォルダを選ぶと、すぐ検索できます）")
         else:
-            self._refresh_index_status()
+            self._index_status_var.set("対象フォルダを選んでください")
 
     def _refresh_index_status(self) -> None:
         self._migrated_note = ""
+        if self._folder_or_none() is None:
+            self._show_start_message()
+            return
         index = self._index_or_none()
         if index is not None and index.exists():
             try:
@@ -2436,6 +2559,9 @@ class ImageSearchApp:
         if not (self._paddle_var.get() and PaddleEngine.is_installed()):
             return None
         model = self._paddle_model_var.get()
+        for other, engine in self._paddle_engines.items():
+            if other != model:
+                engine.close()   # 使わなくなったモデルの子プロセスは終える（メモリを空ける）
         if model not in self._paddle_engines:
             self._paddle_engines[model] = PaddleEngine(model)
         return self._paddle_engines[model]
@@ -2806,6 +2932,8 @@ class ImageSearchApp:
                     "（登録済みの分は残り、次回は続きから処理します）"):
                 return
             self._control.stop()
+        for engine in self._paddle_engines.values():
+            engine.close()   # PaddleOCR の子プロセスを終える
         self._close_preview_archive()
         clean_tmp_dir()   # 取り出した一時ファイル（開いているアプリがあれば消せずに次回起動時に消す）
         self._root.destroy()
@@ -2816,6 +2944,8 @@ class ImageSearchApp:
 # ════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--paddle-worker":
+        sys.exit(_paddle_worker_main(sys.argv[2]))   # PaddleEngine が起動する子プロセス
     root = tk.Tk()
     ImageSearchApp(root)
     root.mainloop()
