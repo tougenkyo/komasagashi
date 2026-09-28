@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.04"
+__version__ = "1.05"
 
 import hashlib
 import importlib.util
@@ -987,6 +987,21 @@ class TextIndex:
         with self._connect() as conn:
             conn.executemany("UPDATE images SET mtime = ?, size = ? WHERE relpath = ?", rows)
 
+    def export_rows(self, relpaths: list[str] | None = None) -> list[dict]:
+        """
+        書き出し用に登録内容を返す。relpaths を渡せばその順で、None なら全件を自然順で。
+        各要素: {"relpath", "text", "engine", "blocks": [((x1, y1, x2, y2), 文字), ...]}
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT relpath, text, engine, blocks FROM images").fetchall()
+        by_rel = {r[0]: {"relpath": r[0], "text": r[1], "engine": r[2] or _ENGINE_MOKURO,
+                         "blocks": [((b[0], b[1], b[2], b[3]), b[4])
+                                    for b in (json.loads(r[3]) if r[3] else [])]}
+                  for r in rows}
+        if relpaths is None:
+            return [by_rel[r] for r in sorted(by_rel, key=_natural_sort_key)]
+        return [by_rel[r] for r in relpaths if r in by_rel]
+
     def get_blocks(self, relpath: str) -> list[tuple[Box, str]] | None:
         """吹き出しごとの (矩形, 文字) を返す。位置情報のない古い索引なら None。"""
         with self._connect() as conn:
@@ -1727,7 +1742,8 @@ class Settings:
         self._migrate_from_appdata()
         self._data: dict = {}
         try:
-            self._data = json.loads(self._path.read_text(encoding="utf-8"))
+            # メモ帳などで保存すると先頭に BOM が付くことがあるので utf-8-sig で読む
+            self._data = json.loads(self._path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             pass
 
@@ -1791,6 +1807,84 @@ def parse_percent(text: str) -> float | None:
 def format_percent(scale: float) -> str:
     pct = scale * 100
     return f"{pct:.0f}%" if pct >= 10 else f"{pct:.1f}%"
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 書き出し（CSV / JSON / TXT）
+# ════════════════════════════════════════════════════════════════════════
+
+EXPORT_FORMATS = {".csv": "csv", ".json": "json", ".txt": "txt"}
+
+
+def export_results(path: Path, rows: list[dict], *, folder: Path,
+                   terms: list[str] | None = None, fuzzy: bool = True) -> int:
+    """
+    登録内容（TextIndex.export_rows）を path の拡張子の形式で書き出し、件数を返す。
+    terms を渡すと検索結果として書き出す（ヒット箇所の列・検索条件が付く）。
+      CSV  … Excel 向け。1 ページ 1 行。UTF-8（BOM 付き。Excel で文字化けしない）
+      JSON … すべての情報（吹き出しの位置・OCR エンジンなど）。別のプログラムで使う向け
+      TXT  … 読む・文章を貼り付ける向け。ページ名と全文を順に並べる
+    """
+    fmt = EXPORT_FORMATS.get(path.suffix.lower())
+    if fmt is None:
+        raise ValueError(f"対応していない形式です: {path.suffix}（.csv / .json / .txt）")
+    items = []
+    for row in rows:
+        outer, member = split_relpath(row["relpath"])
+        items.append({
+            "name": PurePosixPath(member).name if member else Path(outer).name,
+            "archive": Path(outer).name if member else "",
+            "location": display_path(row["relpath"]),
+            "snippet": make_snippet(row["text"], terms, fuzzy) if terms else "",
+            **row,
+        })
+    exported_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    if fmt == "csv":
+        import csv
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            header = ["画像名", "書庫名", "場所"] + (["ヒット箇所"] if terms else []) + ["全文", "OCR エンジン"]
+            w.writerow(header)
+            for it in items:
+                w.writerow([it["name"], it["archive"], it["location"]]
+                           + ([it["snippet"]] if terms else []) + [it["text"], it["engine"]])
+    elif fmt == "json":
+        data = {
+            "app": "KomaSagashi",
+            "version": __version__,
+            "exported_at": exported_at,
+            "folder": str(folder),
+            "search": {"terms": terms, "ignore_variants": fuzzy} if terms else None,
+            "count": len(items),
+            "items": [{
+                "name": it["name"],
+                "archive": it["archive"] or None,
+                "relpath": it["relpath"],
+                **({"snippet": it["snippet"]} if terms else {}),
+                "text": it["text"],
+                "lines": it["text"].splitlines(),
+                "engine": it["engine"],
+                # 吹き出し（PaddleOCR なら行）ごとの位置。座標は元画像の px
+                "blocks": [{"box": list(box), "text": text} for box, text in it["blocks"]],
+            } for it in items],
+        }
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        title = (f"検索結果: {' '.join(terms)}（{len(items)} 件）" if terms
+                 else f"索引全体（{len(items)} 件）")
+        out = [f"KomaSagashi v{__version__} 書き出し", f"対象フォルダ: {folder}", title,
+               f"書き出し日時: {exported_at}", "=" * 60, ""]
+        for it in items:
+            out.append(f"■ {it['name']}" + (f"（{it['archive']}）" if it["archive"] else ""))
+            out.append(it["text"] if it["text"].strip() else "（文字なし）")
+            out.append("")
+        path.write_text("\n".join(out), encoding="utf-8")
+    return len(items)
+
+
+def export_file_name(stem: str) -> str:
+    """書き出すファイルの名前に使えない文字を置き換える。"""
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem).strip(" .")[:80] or "komasagashi"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2301,6 +2395,9 @@ class ImageSearchApp:
         self._stop_btn = ttk.Button(f, text="■ 停止", command=self._stop_index,
                                     state="disabled")
         self._stop_btn.pack(side="left", padx=2)
+        self._export_all_btn = ttk.Button(f, text="索引全体を書き出す…",
+                                          command=self._export_index)
+        self._export_all_btn.pack(side="left", padx=(8, 0))
 
         f = ttk.LabelFrame(tab, text="ログ")
         f.pack(fill="both", expand=True, padx=8, pady=4)
@@ -2326,6 +2423,9 @@ class ImageSearchApp:
                         command=self._on_fuzzy_changed).pack(side="left", padx=(8, 0))
         self._hit_var = tk.StringVar(value="")
         ttk.Label(f, textvariable=self._hit_var, width=14, anchor="e").pack(side="left", padx=4)
+        self._export_hits_btn = ttk.Button(f, text="検索結果を書き出す…",
+                                           command=self._export_hits, state="disabled")
+        self._export_hits_btn.pack(side="left")
 
         paned = ttk.Panedwindow(tab, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=8, pady=4)
@@ -2543,6 +2643,7 @@ class ImageSearchApp:
 
     def _set_running(self, running: bool) -> None:
         self._run_btn.state(["disabled"] if running else ["!disabled"])
+        self._export_all_btn.state(["disabled"] if running else ["!disabled"])
         for btn in (self._pause_btn, self._stop_btn):
             btn.state(["!disabled"] if running else ["disabled"])
         self._pause_btn.config(text="⏸ 一時停止")
@@ -2695,6 +2796,7 @@ class ImageSearchApp:
         self._tree.delete(*self._tree.get_children())
         self._result_map.clear()
         self._clear_preview()
+        self._export_hits_btn.state(["disabled"])
 
         if not terms:
             self._hit_var.set("")
@@ -2714,6 +2816,70 @@ class ImageSearchApp:
         self._hit_var.set(f"ヒット: {len(rows)} 件")
         if not rows:
             self._hit_var.set("ヒット: 0 件")
+        else:
+            self._export_hits_btn.state(["!disabled"])
+
+    # ── 書き出し ──────────────────────────────────────────────────────
+
+    def _ask_export_path(self, initial_name: str) -> Path | None:
+        """保存先を尋ねる。拡張子を書かなかったときは、選んだ「ファイルの種類」の拡張子を付ける。"""
+        initial_dir = self._settings.get("last_export_dir")
+        if not initial_dir or not Path(initial_dir).is_dir():
+            docs = Path.home() / "Documents"
+            initial_dir = str(docs if docs.is_dir() else Path.home())
+        kinds = [("CSV（Excel で開く）", ".csv"), ("テキスト（読む・貼り付ける）", ".txt"),
+                 ("JSON（別のプログラムで使う）", ".json")]
+        type_var = tk.StringVar(value=kinds[0][0])
+        filename = filedialog.asksaveasfilename(
+            title="書き出し", initialdir=initial_dir, initialfile=initial_name + ".csv",
+            filetypes=[(label, "*" + ext) for label, ext in kinds], typevariable=type_var)
+        if not filename:
+            return None
+        path = Path(filename)
+        if path.suffix.lower() not in EXPORT_FORMATS:
+            ext = next((e for label, e in kinds if label == type_var.get()), ".csv")
+            path = path.with_name(path.name + ext)
+        self._settings.set("last_export_dir", str(path.parent))
+        return path
+
+    def _do_export(self, path: Path, rows: list[dict], index: TextIndex,
+                   terms: list[str] | None) -> None:
+        try:
+            n = export_results(path, rows, folder=index.root, terms=terms,
+                               fuzzy=self._last_fuzzy)
+        except Exception as exc:
+            messagebox.showerror("エラー", f"書き出せませんでした:\n{exc}")
+            return
+        if messagebox.askyesno("書き出しました",
+                               f"{n} 件を書き出しました。\n{path}\n\n保存したフォルダを開きますか？"):
+            if os.name == "nt":
+                subprocess.run(["explorer", "/select,", str(path)])
+
+    def _export_hits(self) -> None:
+        """② 検索タブ: いまの検索結果（一覧の順）を書き出す。"""
+        index = self._index_or_none()
+        relpaths = [self._result_map[iid][2] for iid in self._tree.get_children()
+                    if iid in self._result_map]
+        if index is None or not relpaths:
+            return
+        path = self._ask_export_path(
+            export_file_name(f"検索結果_{' '.join(self._last_terms)}"))
+        if path:
+            self._do_export(path, index.export_rows(relpaths), index, self._last_terms)
+
+    def _export_index(self) -> None:
+        """① タブ: 対象フォルダの索引全体を書き出す。"""
+        index = self._index_or_none()
+        if index is None:
+            messagebox.showerror("エラー", "対象フォルダを指定してください。"); return
+        if not index.exists():
+            messagebox.showwarning("インデックスなし",
+                                   "このフォルダにはインデックスがありません。\n"
+                                   "先に「インデックス作成/更新」を実行してください。")
+            return
+        path = self._ask_export_path(export_file_name(f"索引_{index.root.name}"))
+        if path:
+            self._do_export(path, index.export_rows(), index, None)
 
     def _on_fuzzy_changed(self) -> None:
         self._settings.set("fuzzy_search", bool(self._fuzzy_var.get()))
