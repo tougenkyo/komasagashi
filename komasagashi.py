@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.02"
+__version__ = "1.03"
 
 import hashlib
 import importlib.util
@@ -99,6 +99,10 @@ _SNIPPET_PAD            = 30      # スニペットでヒット語の前後に�
 _ENGINE_MOKURO     = "mokuro"
 _PADDLE_MODELS     = ("small", "medium")   # PP-OCRv6 のモデルの大きさ
 _PADDLE_MIN_HRATIO = 0.8    # 文字の面積のうち横書きがこの割合以上のページを PaddleOCR で読み直す
+# mokuro が読めた文字（記号・空白を除く）がこれ未満のページは読み直さない。
+# 英字ロゴだけのページなどが「横書きのページ」に入り、PaddleOCR が 1 枚 15 秒以上かけて
+# 意味のない文字を読んでいたため（目次は 200 文字以上、ロゴのページは 10 文字前後）。
+_PADDLE_MIN_CHARS  = 20
 
 # ── コマ検出 ──────────────────────────────────────────────────────────────
 _PANEL_WORK_SIZE   = 1000   # 検出はこの長辺まで縮小して行う（速度のため）
@@ -121,6 +125,16 @@ def _format_elapsed(seconds: float) -> str:
     h, r = divmod(seconds, 3600)
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+
+def _format_seconds(seconds: float) -> str:
+    """1 枚ごとの時間の表示。1 分未満は小数 1 桁（切り捨ての「00:02」だと 2.9 秒でも 2 秒に見えるため）。"""
+    return f"{seconds:.1f}秒" if seconds < 60 else _format_elapsed(seconds)
+
+
+def _meaningful_chars(text: str) -> int:
+    """記号・空白を除いた文字数（OCR が読めた文字の量の目安）。"""
+    return sum(1 for c in text if c.isalnum())
 
 
 def _natural_sort_key(name: str) -> list:
@@ -840,6 +854,7 @@ class IndexedRow:
     engine: str            # 読み取った OCR エンジン（"mokuro" / "paddle-small" など）
     hratio: float | None   # 文字の面積のうち横書きの割合（mokuro の判定）。None は判定前の古い行
     sig: str | None = None # 書庫内の画像の CRC32:サイズ（mtime / size は書庫ファイルのもの）
+    n_chars: int = 0       # 登録済みの文字数（記号・空白を除く）
 
 
 class TextIndex:
@@ -923,9 +938,10 @@ class TextIndex:
     def load_existing(self) -> dict[str, IndexedRow]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT relpath, mtime, size, blocks IS NOT NULL, engine, hratio, sig FROM images"
-            ).fetchall()
-        return {r[0]: IndexedRow(r[1], r[2], bool(r[3]), r[4] or _ENGINE_MOKURO, r[5], r[6])
+                "SELECT relpath, mtime, size, blocks IS NOT NULL, engine, hratio, sig, text"
+                " FROM images").fetchall()
+        return {r[0]: IndexedRow(r[1], r[2], bool(r[3]), r[4] or _ENGINE_MOKURO, r[5], r[6],
+                                 _meaningful_chars(r[7]))
                 for r in rows}
 
     def upsert(self, relpath: str, page: "PageText", mtime: float, size: int,
@@ -1328,16 +1344,29 @@ class IndexControl:
         self._running = threading.Event()
         self._running.set()
         self._stop = threading.Event()
+        self._paused_at: float | None = None
+        self._paused_total = 0.0
 
     def pause(self) -> None:
+        if self._paused_at is None:
+            self._paused_at = time.time()
         self._running.clear()
 
     def resume(self) -> None:
+        if self._paused_at is not None:
+            self._paused_total += time.time() - self._paused_at
+            self._paused_at = None
         self._running.set()
 
     def stop(self) -> None:
         self._stop.set()
-        self._running.set()   # 一時停止中でもすぐ止められるように待ちを解く
+        self.resume()   # 一時停止中でもすぐ止められるように待ちを解く
+
+    @property
+    def paused_seconds(self) -> float:
+        """一時停止していた時間の合計（処理時間から除くため）。"""
+        current = time.time() - self._paused_at if self._paused_at is not None else 0.0
+        return self._paused_total + current
 
     @property
     def paused(self) -> bool:
@@ -1401,8 +1430,10 @@ class IndexWorker(threading.Thread):
     def _log(self, msg: str) -> None:
         self._q.put(_WorkerMessage("log", msg))
 
-    def _wants_paddle(self, hratio: float | None) -> bool:
-        return self._paddle is not None and hratio is not None and hratio >= _PADDLE_MIN_HRATIO
+    def _wants_paddle(self, hratio: float | None, n_chars: int) -> bool:
+        """横書きの文字がほとんどで、ある程度の量の文字があるページだけ PaddleOCR で読み直す。"""
+        return (self._paddle is not None and hratio is not None and hratio >= _PADDLE_MIN_HRATIO
+                and n_chars >= _PADDLE_MIN_CHARS)
 
     def _ensure_paddle(self) -> bool:
         """PaddleOCR を必要になった時点で読み込む。失敗したら以降は使わない。"""
@@ -1430,7 +1461,7 @@ class IndexWorker(threading.Thread):
         if self._paddle is not None and prev.hratio is None:
             self._unjudged += 1   # 縦書き・横書きの判定が未登録（古い索引）なので mokuro から
             return "full"
-        if self._wants_paddle(prev.hratio) and prev.engine != self._paddle.name:
+        if self._wants_paddle(prev.hratio, prev.n_chars) and prev.engine != self._paddle.name:
             return "reread"
         return "skip"
 
@@ -1515,6 +1546,7 @@ class IndexWorker(threading.Thread):
             self._index.set_archive(rel, job.stat.st_mtime, job.stat.st_size, "done")
 
     def _process_all(self) -> None:
+        begin = time.time()   # 書庫の確認なども含めた処理時間を出すため
         root = self._index.root
         existing = self._index.load_existing()
 
@@ -1625,12 +1657,12 @@ class IndexWorker(threading.Thread):
                                            job.stat.st_size, job.sig)
                         n_ok += 1
                         n_paddle += n_used_paddle
-                        self._log(f"    ✅ 完了 ({_format_elapsed(time.time() - t0)})")
+                        self._log(f"    ✅ 完了 ({_format_seconds(time.time() - t0)})")
                     ok = True
                 except Exception as exc:
                     n_err += 1
                     ok = False
-                    self._log(f"    ⚠ エラー ({_format_elapsed(time.time() - t0)}): {exc}")
+                    self._log(f"    ⚠ エラー ({_format_seconds(time.time() - t0)}): {exc}")
                 if job.member is not None:
                     self._archive_job_finished(job, ok)
                 self._q.put(_WorkerMessage("progress", (idx, total)))
@@ -1638,7 +1670,10 @@ class IndexWorker(threading.Thread):
             if reader is not None:
                 reader.close()
 
-        elapsed = time.time() - start
+        # 一時停止していた時間は数えない
+        paused = self._control.paused_seconds
+        ocr_time = max(0.0, time.time() - start - paused)
+        whole = max(0.0, time.time() - begin - paused)
         done = n_ok + n_err
         self._log(
             f"\n{'=' * 50}\n"
@@ -1647,25 +1682,28 @@ class IndexWorker(threading.Thread):
             + f"OCR 成功: {n_ok} 件（うち PaddleOCR: {n_paddle} 件） / 失敗: {n_err} 件 / "
             f"スキップ: {skipped} 件" + (f" / 未処理: {total - done} 件" if stopped else "") + "\n"
             f"インデックス総数: {self._index.count()} 件\n"
-            f"処理時間: {_format_elapsed(elapsed)}"
-            + (f" (平均 {elapsed / done:.1f}秒/枚)" if done else "")
+            f"処理時間: {_format_elapsed(whole)}（うち OCR {_format_elapsed(ocr_time)}"
+            + (f"・1 枚あたり平均 {ocr_time / done:.1f}秒" if done else "") + "）"
         )
         self._q.put(_WorkerMessage("stopped" if stopped else "done", str(self._index.count())))
 
     def _recognize(self, job: "_Job", image: Image.Image) -> tuple[PageText | None, int]:
         """mokuro で読み、横書きのページなら PaddleOCR で読み直す。(結果, PaddleOCR を使ったか)"""
         if job.mode == "full":
+            t1 = time.time()
             page = self._engine.recognize(image, max_image_size=self._max_image_size)
-            hratio = page.hratio
+            hratio, n_chars = page.hratio, _meaningful_chars(page.text)
+            mokuro_time = time.time() - t1
         else:
-            page, hratio = None, job.prev.hratio
-        if self._wants_paddle(hratio) and self._ensure_paddle():
+            page, hratio, n_chars = None, job.prev.hratio, job.prev.n_chars
+        if self._wants_paddle(hratio, n_chars) and self._ensure_paddle():
             t1 = time.time()
             paddle_page = self._paddle.recognize(image)
             paddle_page.hratio = hratio
             if paddle_page.text.strip() or page is None:
+                where = f"mokuro {_format_seconds(mokuro_time)} → " if page is not None else ""
                 self._log(f"    ↳ 横書きのページ → PaddleOCR で読み直し "
-                          f"({_format_elapsed(time.time() - t1)})")
+                          f"({where}PaddleOCR {_format_seconds(time.time() - t1)})")
                 return paddle_page, 1
         return page, 0
 
