@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.03"
+__version__ = "1.04"
 
 import hashlib
 import importlib.util
@@ -167,11 +167,14 @@ def split_relpath(relpath: str) -> tuple[str, str | None]:
 
 
 def display_name(relpath: str) -> str:
-    """一覧に出す名前。書庫内の画像は「書庫名 › 画像名」。"""
+    """
+    一覧に出す名前。書庫内の画像は「画像名（書庫名）」。
+    書庫名が長いと欄に収まらず、どのページか見えなくなるので画像名を先にする。
+    """
     outer, member = split_relpath(relpath)
     if member is None:
         return Path(outer).name
-    return f"{Path(outer).name} › {PurePosixPath(member).name}"
+    return f"{PurePosixPath(member).name}（{Path(outer).name}）"
 
 
 def display_path(relpath: str) -> str:
