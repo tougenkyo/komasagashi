@@ -10,7 +10,7 @@ OCR 結果をファイル名に埋め込む方式と違い、全文を SQLite �
   ・元のファイル名を保ったまま
   ・何度でも高速に再検索できる
   ・検索ヒットからその場で元画像を開ける
-  ・ヒットした吹き出しを含むコマを自動で囲み、枠を微調整して
+  ・ヒットした吹き出しを含むコマを自動で囲み、枠を微調整（補正で一回り大きく・小さくも可）して
     クリップボードへコピー・画像で保存できる（出力倍率を指定可、プレビューは拡大縮小可）
   ・一度インデックスを作ったフォルダを記憶し、次回は一覧から選べる
   ・（任意）横書きの文字しかないページ（目次・扉など）を PaddleOCR で読み直す
@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.06"
+__version__ = "1.07"
 
 import hashlib
 import importlib.util
@@ -456,6 +456,28 @@ def pick_panel(panels: list[Box], hit: Box, image_size: tuple[int, int]) -> Box:
     pad = round(max(w, h) * _HIT_PAD)
     return (max(0, hit[0] - pad), max(0, hit[1] - pad),
             min(w, hit[2] + pad), min(h, hit[3] + pad))
+
+
+FRAME_ADJUST_MIN, FRAME_ADJUST_MAX = -50, 100   # 枠の補正（%）の範囲
+
+
+def scale_box(box, factor: float) -> list[float]:
+    """枠を中心から幅・高さとも factor 倍にする（画像の外にはみ出してもよい）。"""
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    hw, hh = (x2 - x1) * factor / 2, (y2 - y1) * factor / 2
+    return [cx - hw, cy - hh, cx + hw, cy + hh]
+
+
+def adjust_box(box, percent: float, image_size: tuple[int, int]) -> list[float]:
+    """枠の補正: 幅・高さとも percent % 大きく（マイナスなら小さく）し、画像の外は切り詰める。"""
+    x1, y1, x2, y2 = scale_box(box, 1 + percent / 100)
+    w, h = image_size
+    return [max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2)]
+
+
+def format_adjust(percent: int) -> str:
+    return f"{percent:+d}" if percent else "0"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1932,6 +1954,8 @@ class CropCanvas(tk.Canvas):
                                    → 表示位置を動かす（画像が画面からはみ出しているとき）
       ・ホイール                   → マウスの位置を中心に拡大・縮小
     座標は元画像の px で持ち、表示するときだけ拡大・縮小する。
+    枠は「補正する前の枠」（_base）と補正（%）から求める。手で直した枠は、
+    補正を差し引いて _base に戻しておくので、補正を変えても直した形を基準に広がる・狭まる。
     表示は見えている範囲だけを切り出して描くので、高倍率でも重くならない。
     """
     ZOOM_LEVELS = (0.1, 0.15, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0,
@@ -1960,7 +1984,9 @@ class CropCanvas(tk.Canvas):
         self._imgtk = None                   # GC 防止のため参照を保持
         self._panels: list[Box] = []
         self._hits: list[Box] = []
-        self._sel: list[float] | None = None  # [x1, y1, x2, y2]（元画像の px）
+        self._sel: list[float] | None = None  # [x1, y1, x2, y2]（元画像の px、補正後）
+        self._base: list[float] | None = None # 補正する前の枠（画像の外にはみ出してもよい）
+        self._adjust = 0                      # 枠の補正（%）
         self._message = ""
         self._fit = True                      # True: 画面に収まる倍率に自動で合わせる
         self._scale, self._ox, self._oy = 1.0, 0.0, 0.0   # 倍率と、画像左上の表示位置
@@ -1985,7 +2011,7 @@ class CropCanvas(tk.Canvas):
     def show(self, image: Image.Image, panels: list[Box], hits: list[Box],
              selection: Box | None) -> None:
         self._image, self._panels, self._hits = image, panels, hits
-        self._sel = list(selection) if selection else None
+        self._set_base(selection)
         self._drag = None
         self._fit = True
         self._render()
@@ -1993,7 +2019,7 @@ class CropCanvas(tk.Canvas):
 
     def clear(self, message: str) -> None:
         self._image, self._imgtk = None, None
-        self._panels, self._hits, self._sel = [], [], None
+        self._panels, self._hits, self._sel, self._base = [], [], None, None
         self._message = message
         self._render()
         self._on_change(None)
@@ -2016,6 +2042,26 @@ class CropCanvas(tk.Canvas):
     def crop(self) -> Image.Image | None:
         box = self.selection()
         return self._image.crop(box) if self._image is not None and box else None
+
+    def set_adjust(self, percent: int) -> None:
+        """枠の補正（%）を変え、今の枠をその場で広げる・狭める。"""
+        self._adjust = percent
+        if self._image is None or self._base is None:
+            return
+        self._sel = adjust_box(self._base, percent, self._image.size)
+        self._draw_overlay()
+        self._on_change(self.selection())
+
+    def _set_base(self, box) -> None:
+        """補正する前の枠を決め、補正した枠を表示用に求める。"""
+        self._base = list(box) if box else None
+        self._sel = (adjust_box(self._base, self._adjust, self._image.size)
+                     if self._base and self._image is not None else None)
+
+    def _sync_base(self) -> None:
+        """手で動かした枠から補正を差し引いて、補正する前の枠に戻す。"""
+        self._base = (scale_box(self._sel, 1 / (1 + self._adjust / 100))
+                      if self._sel else None)
 
     def set_hand(self, on: bool) -> None:
         self._hand = on
@@ -2221,6 +2267,7 @@ class CropCanvas(tk.Canvas):
             "view": (self._ox, self._oy),
             "start": self._to_image(event.x, event.y),
             "sel": list(self._sel) if self._sel else None,
+            "base": list(self._base) if self._base else None,
         }
 
     def _on_drag(self, event) -> None:
@@ -2263,6 +2310,7 @@ class CropCanvas(tk.Canvas):
             if "s" in mode:
                 y2 = max(py, y1 + m)
             self._sel = [max(0.0, x1), max(0.0, y1), min(iw, x2), min(ih, y2)]
+        self._sync_base()
         self._draw_overlay()
         self._on_change(self.selection())
 
@@ -2275,11 +2323,11 @@ class CropCanvas(tk.Canvas):
             px, py = self._to_image(event.x, event.y)
             under = [p for p in self._panels if p[0] <= px <= p[2] and p[1] <= py <= p[3]]
             if under:
-                self._sel = list(min(under, key=_area))
+                self._set_base(min(under, key=_area))
         elif d["mode"] == "new" and self._sel is not None:
             x1, y1, x2, y2 = self._sel
             if x2 - x1 < self._MIN_SIZE or y2 - y1 < self._MIN_SIZE:
-                self._sel = d["sel"]   # 小さすぎる枠は取り消す
+                self._sel, self._base = d["sel"], d["base"]   # 小さすぎる枠は取り消す
         self._draw_overlay()
         self._on_change(self.selection())
         self._on_hover(event)
@@ -2294,6 +2342,7 @@ class ImageSearchApp:
     _PREVIEW_PLACEHOLDER = "（結果を選択すると画像を表示）"
     _CROP_HINT = ("赤枠が切り抜く範囲（オレンジはヒットした吹き出し）。辺・角のドラッグで調整、"
                   "内側のドラッグで枠を移動、点線のコマのクリックで切り替え、Shift+ドラッグで新しい枠。"
+                  "「枠の補正」で枠を一回り大きく（＋）・小さく（－）。"
                   "ホイールで拡大縮小、枠の外・ホイールボタン・✋ のドラッグで表示位置を移動。"
                   "右クリックでコピー・保存。")
     _CROP_HINT_NO_BLOCKS = ("この画像は吹き出しの位置が未登録です（古い索引）。"
@@ -2332,6 +2381,9 @@ class ImageSearchApp:
         scale = self._settings.get("output_scale", 1.0)
         self._output_scale = (float(scale) if isinstance(scale, (int, float))
                               and self._OUTPUT_MIN <= scale <= self._OUTPUT_MAX else 1.0)
+        adjust = self._settings.get("frame_adjust", 0)
+        self._frame_adjust = (adjust if isinstance(adjust, int) and not isinstance(adjust, bool)
+                              and FRAME_ADJUST_MIN <= adjust <= FRAME_ADJUST_MAX else 0)
 
         self._build_ui()
         self._show_start_message()
@@ -2535,9 +2587,21 @@ class ImageSearchApp:
         out_box.bind("<<ComboboxSelected>>", lambda _e: self._apply_output_scale())
         out_box.bind("<Return>", lambda _e: self._apply_output_scale())
         out_box.bind("<FocusOut>", lambda _e: self._apply_output_scale())
+        # 枠の補正: 枠を中心から幅・高さとも ±% 広げる・狭める
+        ttk.Label(crop, text="枠の補正:").pack(side="left", padx=(8, 2))
+        self._frame_adjust_var = tk.StringVar(value=format_adjust(self._frame_adjust))
+        adj_box = ttk.Spinbox(crop, textvariable=self._frame_adjust_var, width=5,
+                              from_=FRAME_ADJUST_MIN, to=FRAME_ADJUST_MAX, increment=5,
+                              command=self._apply_frame_adjust)
+        adj_box.pack(side="left")
+        adj_box.bind("<Return>", lambda _e: self._apply_frame_adjust())
+        adj_box.bind("<FocusOut>", lambda _e: self._apply_frame_adjust())
+        ttk.Label(crop, text="%").pack(side="left", padx=(2, 0))
+        self._canvas.set_adjust(self._frame_adjust)
         self._crop_var = tk.StringVar(value="")
-        ttk.Label(crop, textvariable=self._crop_var, anchor="w").pack(
-            side="left", fill="x", expand=True, padx=6)
+        # 枠の大きさは行が溢れないよう次の行に出す（出力倍率があると長くなる）
+        ttk.Label(details, textvariable=self._crop_var, anchor="w").pack(
+            fill="x", padx=6, pady=(2, 0))
         self._crop_hint_var = tk.StringVar(value="")
         ttk.Label(details, textvariable=self._crop_hint_var, foreground="gray",
                   anchor="w", wraplength=520).pack(fill="x", padx=4, pady=(2, 0))
@@ -3044,6 +3108,18 @@ class ImageSearchApp:
             self._settings.set("output_scale", scale)
         self._out_scale_var.set(format_percent(self._output_scale))
         self._on_crop_change(self._canvas.selection())
+
+    def _apply_frame_adjust(self) -> None:
+        try:
+            value = round(float(self._frame_adjust_var.get().strip().rstrip("%")))
+        except ValueError:
+            value = self._frame_adjust
+        value = min(max(value, FRAME_ADJUST_MIN), FRAME_ADJUST_MAX)
+        if value != self._frame_adjust:
+            self._frame_adjust = value
+            self._settings.set("frame_adjust", value)
+            self._canvas.set_adjust(value)
+        self._frame_adjust_var.set(format_adjust(value))
 
     def _on_zoom_change(self, scale: float) -> None:
         self._zoom_var.set(format_percent(scale))
