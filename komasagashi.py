@@ -9,7 +9,7 @@ OCR 結果をファイル名に埋め込む方式と違い、全文を SQLite �
   ・255 文字のファイル名制限を受けない
   ・元のファイル名を保ったまま
   ・何度でも高速に再検索できる
-  ・検索ヒットからその場で元画像を開ける
+  ・検索ヒットからその場で元画像を開ける・前後のページも見られる
   ・ヒットした吹き出しを含むコマを自動で囲み、枠を微調整（補正で一回り大きく・小さくも可）して
     クリップボードへコピー・画像で保存できる（出力倍率を指定可、プレビューは拡大縮小可）
   ・一度インデックスを作ったフォルダを記憶し、次回は一覧から選べる
@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.09"
+__version__ = "1.10"
 
 import hashlib
 import importlib.util
@@ -163,6 +163,23 @@ def _collect_files(folder: Path, recursive: bool) -> list[Path]:
     exts = _IMAGE_EXTS | _ARCHIVE_EXTS.keys()
     files = [p for p in it if p.is_file() and p.suffix.lower() in exts]
     return sorted(files, key=lambda p: _natural_sort_key(str(p.relative_to(folder))))
+
+
+def sibling_pages(root: Path, relpath: str, reader: "ArchiveReader | None" = None) -> list[str]:
+    """
+    relpath の前後のページを数えるための、並び順どおりの画像の relpath 一覧。
+    フォルダの画像なら同じフォルダの画像、書庫の中の画像なら同じ書庫の画像（reader が必要）。
+    索引に無い画像も含む（途中で止めた巻でも前後を見られるように）。
+    """
+    outer, member = split_relpath(relpath)
+    if member is None:
+        folder = (root / relpath).parent
+        files = [p for p in folder.iterdir()
+                 if p.suffix.lower() in _IMAGE_EXTS and p.is_file()]
+        return [str(p.relative_to(root))
+                for p in sorted(files, key=lambda p: _natural_sort_key(p.name))]
+    names = sorted((m.name for m in reader.members()), key=_natural_sort_key)
+    return [outer + _ARCHIVE_SEP + n for n in names]
 
 
 def split_relpath(relpath: str) -> tuple[str, str | None]:
@@ -1037,6 +1054,12 @@ class TextIndex:
         if row is None or row[0] is None:
             return None
         return [((b[0], b[1], b[2], b[3]), b[4]) for b in json.loads(row[0])]
+
+    def get_text(self, relpath: str) -> str | None:
+        """登録した全文。索引に無いページなら None。"""
+        with self._connect() as conn:
+            row = conn.execute("SELECT text FROM images WHERE relpath = ?", (relpath,)).fetchone()
+        return row[0] if row else None
 
     def delete_many(self, relpaths: list[str]) -> None:
         if not relpaths:
@@ -2350,6 +2373,8 @@ class ImageSearchApp:
     _CROP_HINT_NO_BLOCKS = ("この画像は吹き出しの位置が未登録です（古い索引）。"
                             "① でインデックスを更新すると、ヒットしたコマが自動で選ばれます。"
                             "今は点線のコマをクリックするか、Shift+ドラッグで枠を描いてください。")
+    _CROP_HINT_UNREGISTERED = ("このページはまだ索引に登録されていません（① のインデックス作成/更新で登録されます）。"
+                               "点線のコマをクリックするか、Shift+ドラッグで枠を描いてください。")
     _ZOOM_FIT_LABEL = "全体表示"
     _OUTPUT_SCALES = ("25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%")
     _OUTPUT_MIN, _OUTPUT_MAX = 0.05, 8.0
@@ -2374,6 +2399,9 @@ class ImageSearchApp:
         # 検索結果 iid → (絶対パス, 全文, 相対パス) の対応
         self._result_map: dict[str, tuple[Path, str, str]] = {}   # iid → (対象フォルダ, 全文, relpath)
         self._preview_reader: ArchiveReader | None = None           # プレビュー中の書庫
+        self._view: tuple[Path, str] | None = None    # プレビュー中のページ（対象フォルダ, relpath）
+        self._origin: str | None = None               # 一覧で選んだページ（前後に動かす前）
+        self._pages: tuple[tuple, list[str]] | None = None   # (フォルダ/書庫, 並び順の relpath)
         clean_tmp_dir()   # 前回の一時ファイルが残っていれば消す
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._last_terms: list[str] = []
@@ -2528,6 +2556,7 @@ class ImageSearchApp:
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self._tree.bind("<<TreeviewSelect>>", self._on_result_select)
+        self._tree.bind("<ButtonRelease-1>", self._on_tree_click)
         self._tree.bind("<Double-1>", lambda _e: self._open_default())
         self._tree.bind("<Control-c>", self._copy_crop)
 
@@ -2556,6 +2585,16 @@ class ImageSearchApp:
         ttk.Checkbutton(toolbar, text="✋ 手", style="Toolbutton", variable=self._hand_var,
                         command=lambda: self._canvas.set_hand(self._hand_var.get())
                         ).pack(side="left", padx=(8, 0))
+        # 右端: 前後のページ（同じフォルダ・同じ書庫の中で、並び順の前・次の画像を表示する）
+        self._btn_next_page = ttk.Button(toolbar, text="次のページ", state="disabled",
+                                         command=lambda: self._goto_page(+1))
+        self._btn_next_page.pack(side="right")
+        self._btn_prev_page = ttk.Button(toolbar, text="前のページ", state="disabled",
+                                         command=lambda: self._goto_page(-1))
+        self._btn_prev_page.pack(side="right", padx=(0, 2))
+        self._page_var = tk.StringVar(value="")
+        ttk.Label(toolbar, textvariable=self._page_var, foreground="gray").pack(
+            side="right", padx=(0, 6))
 
         # 下の操作部を先に配置し、残りの高さをすべて画像に使う
         details = ttk.Frame(right)
@@ -2984,15 +3023,11 @@ class ImageSearchApp:
             self._run_search()
 
     def _current_entry(self) -> tuple[Path, str] | None:
-        """選択中の結果の (対象フォルダ, relpath)。"""
-        sel = self._tree.selection()
-        if not sel:
-            return None
-        entry = self._result_map.get(sel[0])
-        return (entry[0], entry[2]) if entry else None
+        """プレビュー中のページの (対象フォルダ, relpath)。前後のページに動かしていればそのページ。"""
+        return self._view
 
     def _current_file(self) -> Path | None:
-        """選択中の結果のファイル（書庫内の画像なら書庫ファイル）。"""
+        """プレビュー中のページのファイル（書庫内の画像なら書庫ファイル）。"""
         entry = self._current_entry()
         return entry[0] / split_relpath(entry[1])[0] if entry else None
 
@@ -3004,12 +3039,74 @@ class ImageSearchApp:
         if not entry:
             return
         root, text, relpath = entry
+        self._origin = relpath
+        self._show_page(root, relpath, text)
+
+    def _on_tree_click(self, event) -> None:
+        """選択中の結果をもう一度クリック → 前後のページから、そのページに戻る。"""
+        iid = self._tree.identify_row(event.y)
+        entry = self._result_map.get(iid)
+        if (entry and iid in self._tree.selection() and self._view is not None
+                and self._view[1] != entry[2]):
+            self._on_result_select()
+
+    def _show_page(self, root: Path, relpath: str, text: str | None) -> None:
+        """ページをプレビューに出す（text は索引の全文。索引に無いページなら None）。"""
+        self._view = (root, relpath)
         outer, member = split_relpath(relpath)
         self._path_var.set(str(root / outer) + (f" › {member}" if member else ""))
         self._btn_explorer.state(["!disabled"])
         self._btn_open.state(["!disabled"])
-        self._show_preview(root, relpath)
-        self._show_fulltext(text)
+        self._show_preview(root, relpath, registered=text is not None)
+        self._show_fulltext(text if text is not None
+                            else "（このページは索引に登録されていません）")
+        self._update_page_nav()
+
+    def _page_list(self) -> list[str]:
+        """プレビュー中のページと同じフォルダ（書庫）の画像を並び順で。同じ場所なら使い回す。"""
+        root, relpath = self._view
+        outer, member = split_relpath(relpath)
+        key = (root, outer) if member is not None else (root, str(Path(relpath).parent))
+        if self._pages is None or self._pages[0] != key:
+            try:
+                reader = self._preview_archive(root / outer) if member is not None else None
+                pages = sibling_pages(root, relpath, reader)
+            except Exception:
+                pages = []
+            self._pages = (key, pages)
+        pages = self._pages[1]
+        return pages if relpath in pages else [relpath]
+
+    def _update_page_nav(self) -> None:
+        if self._view is None:
+            self._page_var.set("")
+            self._btn_prev_page.state(["disabled"])
+            self._btn_next_page.state(["disabled"])
+            return
+        pages = self._page_list()
+        i = pages.index(self._view[1])
+        text = f"{i + 1} / {len(pages)}"
+        if self._origin in pages and self._origin != self._view[1]:
+            text += f"（ヒットから {i - pages.index(self._origin):+d}）"
+        self._page_var.set(text)
+        self._btn_prev_page.state(["!disabled"] if i > 0 else ["disabled"])
+        self._btn_next_page.state(["!disabled"] if i < len(pages) - 1 else ["disabled"])
+
+    def _goto_page(self, step: int) -> None:
+        """同じフォルダ（書庫）の中で、並び順の前・次のページを表示する。"""
+        if self._view is None:
+            return
+        pages = self._page_list()
+        i = pages.index(self._view[1]) + step
+        if not 0 <= i < len(pages):
+            return
+        root, relpath = self._view[0], pages[i]
+        index = self._index_or_none()
+        try:
+            text = index.get_text(relpath) if index is not None and index.root == root else None
+        except sqlite3.Error:
+            text = None
+        self._show_page(root, relpath, text)
 
     def _preview_archive(self, path: Path) -> ArchiveReader:
         """プレビュー用に書庫を開く。同じ書庫のページを続けて見るときは開いたまま使い回す。"""
@@ -3031,7 +3128,7 @@ class ImageSearchApp:
             return load_image(root, relpath)
         return load_image(root, relpath, self._preview_archive(root / outer))
 
-    def _show_preview(self, root: Path, relpath: str) -> None:
+    def _show_preview(self, root: Path, relpath: str, registered: bool = True) -> None:
         if not _IMAGETK_AVAILABLE:
             self._canvas.clear("（プレビューには Pillow の ImageTk が必要）")
             return
@@ -3056,7 +3153,8 @@ class ImageSearchApp:
         selection = pick_panel(panels, hits[0], img.size) if hits else None
         self._canvas.show(img, panels, hits, selection)
         self._crop_hint_var.set(
-            self._CROP_HINT if blocks is not None else self._CROP_HINT_NO_BLOCKS)
+            self._CROP_HINT if blocks is not None
+            else self._CROP_HINT_NO_BLOCKS if registered else self._CROP_HINT_UNREGISTERED)
 
     def _show_fulltext(self, text: str) -> None:
         self._fulltext.config(state="normal")
@@ -3068,6 +3166,8 @@ class ImageSearchApp:
         self._fulltext.config(state="disabled")
 
     def _clear_preview(self) -> None:
+        self._view = self._origin = self._pages = None   # 次に開くときフォルダの中身を数え直す
+        self._update_page_nav()
         self._canvas.clear(self._PREVIEW_PLACEHOLDER)
         self._crop_hint_var.set("")
         self._path_var.set("")
