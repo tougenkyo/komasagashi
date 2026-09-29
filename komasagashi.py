@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.08"
+__version__ = "1.09"
 
 import hashlib
 import importlib.util
@@ -2593,7 +2593,7 @@ class ImageSearchApp:
         ttk.Label(crop, text="枠の補正:").pack(side="left", padx=(8, 2))
         self._frame_adjust_var = tk.StringVar(value=format_adjust(self._frame_adjust))
         adj_box = ttk.Spinbox(crop, textvariable=self._frame_adjust_var, width=5,
-                              from_=FRAME_ADJUST_MIN, to=FRAME_ADJUST_MAX, increment=5,
+                              from_=FRAME_ADJUST_MIN, to=FRAME_ADJUST_MAX, increment=1,
                               command=self._apply_frame_adjust)
         adj_box.pack(side="left")
         adj_box.bind("<Return>", lambda _e: self._apply_frame_adjust())
