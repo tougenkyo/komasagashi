@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.07"
+__version__ = "1.08"
 
 import hashlib
 import importlib.util
@@ -1951,7 +1951,7 @@ class CropCanvas(tk.Canvas):
       ・点線のコマをクリック       → そのコマを枠にする
       ・Shift + ドラッグ           → 新しく枠を描く
       ・枠の外をドラッグ / ホイールボタンでドラッグ / 手モードでドラッグ
-                                   → 表示位置を動かす（画像が画面からはみ出しているとき）
+                                   → 表示位置を動かす（制限なし。「全体表示」で中央に戻る）
       ・ホイール                   → マウスの位置を中心に拡大・縮小
     座標は元画像の px で持ち、表示するときだけ拡大・縮小する。
     枠は「補正する前の枠」（_base）と補正（%）から求める。手で直した枠は、
@@ -2121,13 +2121,12 @@ class CropCanvas(tk.Canvas):
         cw, ch = max(1, self.winfo_width()), max(1, self.winfo_height())
         return min(cw / iw, ch / ih, self._FIT_MAX)
 
-    def _clamp_view(self) -> None:
-        """画面に収まる向きは中央に置き、はみ出す向きは画像の外が見えないようにする。"""
+    def _center_view(self) -> None:
+        """画像を画面の中央に置く（全体表示のとき）。"""
         iw, ih = self._image.size
         cw, ch = self.winfo_width(), self.winfo_height()
-        dw, dh = iw * self._scale, ih * self._scale
-        self._ox = (cw - dw) / 2 if dw <= cw else min(0.0, max(cw - dw, self._ox))
-        self._oy = (ch - dh) / 2 if dh <= ch else min(0.0, max(ch - dh, self._oy))
+        self._ox = (cw - iw * self._scale) / 2
+        self._oy = (ch - ih * self._scale) / 2
 
     def _render(self) -> None:
         for job in (self._resize_job, self._render_job):
@@ -2140,9 +2139,11 @@ class CropCanvas(tk.Canvas):
             self.create_text(cw / 2, ch / 2, text=self._message, fill="#555555",
                              width=max(100, cw - 40), justify="center")
             return
+        # 全体表示のときだけ中央に置く。それ以外は表示位置を制限しない
+        # （画像の端を画面の中央まで持ってくるなど、自由に動かせる）
         if self._fit:
             self._scale = self._fit_scale()
-        self._clamp_view()
+            self._center_view()
 
         # 見えている範囲だけを切り出して拡大・縮小する
         s = self._scale
@@ -2282,6 +2283,7 @@ class CropCanvas(tk.Canvas):
             mode = d["mode"] = "pan"
             self.config(cursor="fleur")
         if mode == "pan":
+            self._fit = False   # 動かした位置を保つ（全体表示のままだと中央に戻ってしまう）
             self._ox, self._oy = d["view"][0] + dx, d["view"][1] + dy
             self._request_render()
             return
