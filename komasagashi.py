@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.10"
+__version__ = "1.11"
 
 import hashlib
 import importlib.util
@@ -49,6 +49,34 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Callable, Iterator
+
+
+def _relaunch_in_venv() -> None:
+    """
+    setup.bat が作った .venv 以外の Python で起動されたら、.venv の Python で起動し直す。
+    .py / .pyw をダブルクリックすると関連付けられた Python（.venv ではない）で動き、
+    .venv にだけ入れた PaddleOCR などが「入っていない」扱いになるため。
+    コンソール無し（pythonw）で起動されたら、起動し直してもコンソール無しのまま。
+    """
+    venv = Path(__file__).resolve().parent / ".venv"
+    if os.environ.get("KOMASAGASHI_RELAUNCHED") or not venv.is_dir():
+        return
+    try:
+        if Path(sys.prefix).resolve() == venv.resolve():
+            return
+    except OSError:
+        return
+    windowed = sys.stdout is None or Path(sys.executable).stem.lower() == "pythonw"
+    exe = venv / "Scripts" / ("pythonw.exe" if windowed else "python.exe")
+    if not exe.is_file():
+        return
+    env = dict(os.environ, KOMASAGASHI_RELAUNCHED="1")   # 念のため起動し直しが繰り返さないように
+    sys.exit(subprocess.call(
+        [str(exe), "-W", "ignore", str(Path(__file__).resolve()), *sys.argv[1:]], env=env))
+
+
+if __name__ == "__main__":
+    _relaunch_in_venv()   # PIL などを読み込む前に（PC 全体の Python には入っていないことがある）
 
 from PIL import Image
 
