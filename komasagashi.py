@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.11"
+__version__ = "1.12"
 
 import hashlib
 import importlib.util
@@ -2442,6 +2442,7 @@ class ImageSearchApp:
         adjust = self._settings.get("frame_adjust", 0)
         self._frame_adjust = (adjust if isinstance(adjust, int) and not isinstance(adjust, bool)
                               and FRAME_ADJUST_MIN <= adjust <= FRAME_ADJUST_MAX else 0)
+        self._show_hint = self._settings.get("show_crop_hint", True) is not False
 
         self._build_ui()
         self._show_start_message()
@@ -2667,18 +2668,26 @@ class ImageSearchApp:
         adj_box.bind("<FocusOut>", lambda _e: self._apply_frame_adjust())
         ttk.Label(crop, text="%").pack(side="left", padx=(2, 0))
         self._canvas.set_adjust(self._frame_adjust)
+        # 枠の大きさは行が溢れないよう次の行に出す（出力倍率があると長くなる）。
+        # 同じ行の右端に、操作の説明を折り畳むボタン（畳むとプレビューが数行ぶん広くなる）
+        size_row = ttk.Frame(details)
+        size_row.pack(fill="x", padx=(6, 4), pady=(2, 0))
+        self._hint_toggle = ttk.Label(size_row, foreground="#1a5fb4", cursor="hand2")
+        self._hint_toggle.pack(side="right")
+        self._hint_toggle.bind("<Button-1>", lambda _e: self._toggle_hint())
         self._crop_var = tk.StringVar(value="")
-        # 枠の大きさは行が溢れないよう次の行に出す（出力倍率があると長くなる）
-        ttk.Label(details, textvariable=self._crop_var, anchor="w").pack(
-            fill="x", padx=6, pady=(2, 0))
+        ttk.Label(size_row, textvariable=self._crop_var, anchor="w").pack(
+            side="left", fill="x", expand=True)
         self._crop_hint_var = tk.StringVar(value="")
-        ttk.Label(details, textvariable=self._crop_hint_var, foreground="gray",
-                  anchor="w", wraplength=520).pack(fill="x", padx=4, pady=(2, 0))
+        self._crop_hint = ttk.Label(details, textvariable=self._crop_hint_var,
+                                    foreground="gray", anchor="w", wraplength=520)
         self._canvas.clear(self._PREVIEW_PLACEHOLDER)
 
         self._path_var = tk.StringVar(value="")
-        ttk.Label(details, textvariable=self._path_var, foreground="gray",
-                  anchor="w", wraplength=520).pack(fill="x", padx=4, pady=(4, 0))
+        self._path_label = ttk.Label(details, textvariable=self._path_var, foreground="gray",
+                                     anchor="w", wraplength=520)
+        self._path_label.pack(fill="x", padx=4, pady=(4, 0))
+        self._update_hint()
 
         btns = ttk.Frame(details)
         btns.pack(fill="x", padx=4, pady=4)
@@ -3238,6 +3247,20 @@ class ImageSearchApp:
             self._settings.set("output_scale", scale)
         self._out_scale_var.set(format_percent(self._output_scale))
         self._on_crop_change(self._canvas.selection())
+
+    def _toggle_hint(self) -> None:
+        self._show_hint = not self._show_hint
+        self._settings.set("show_crop_hint", self._show_hint)
+        self._update_hint()
+
+    def _update_hint(self) -> None:
+        """操作の説明を出す・畳む（畳んでいる間はその行ぶんプレビューが広くなる）。"""
+        if self._show_hint:
+            self._hint_toggle.configure(text="▲ 操作の説明を隠す")
+            self._crop_hint.pack(fill="x", padx=4, pady=(2, 0), before=self._path_label)
+        else:
+            self._hint_toggle.configure(text="▼ 操作の説明")
+            self._crop_hint.pack_forget()
 
     def _apply_frame_adjust(self) -> None:
         try:
