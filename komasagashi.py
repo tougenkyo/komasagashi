@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.13"
+__version__ = "1.14"
 
 import hashlib
 import importlib.util
@@ -339,6 +339,29 @@ def contains_any(text: str, terms: list[str], fuzzy: bool) -> bool:
         return any(fold_text(t) and fold_text(t) in folded for t in terms)
     low = text.lower()
     return any(t.lower() in low for t in terms)
+
+
+_EXCLUDE_PREFIXES = ("-", "!")   # 半角のみ（全角の －・！ は普通の検索語として探す）
+
+
+def parse_query(query: str) -> tuple[list[str], list[str]]:
+    """
+    検索欄の文字を (含む語, 除く語) に分ける。空白（全角も）区切り。
+    `-語` または `!語` はその語を含むページを結果から除く。`-` `!` だけの語は普通の検索語。
+    """
+    include: list[str] = []
+    exclude: list[str] = []
+    for word in query.split():
+        if len(word) > 1 and word[0] in _EXCLUDE_PREFIXES:
+            exclude.append(word[1:])
+        else:
+            include.append(word)
+    return include, exclude
+
+
+def format_query(terms: list[str], exclude: list[str] | None = None) -> str:
+    """検索条件を表示用の 1 行にする（除く語は -語）。"""
+    return " ".join(list(terms) + [f"-{t}" for t in exclude or []])
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1106,20 +1129,26 @@ class TextIndex:
         esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return f"%{esc}%"
 
-    def search(self, terms: list[str], fuzzy: bool = False) -> list[tuple[str, str]]:
+    def search(self, terms: list[str], fuzzy: bool = False,
+               exclude: list[str] | None = None) -> list[tuple[str, str]]:
         """
-        全 term を含む（AND・部分一致・大文字小文字無視）画像を
-        [(relpath, text), ...] で返す。terms が空なら空リスト。
+        全 term を含み（AND・部分一致・大文字小文字無視）、exclude のどれも含まない画像を
+        [(relpath, text), ...] で返す。exclude だけなら、それを含まない全ページ。
+        terms も exclude も空なら空リスト。
         fuzzy=True なら表記ゆれを吸収して比べる（fold_text）。
         """
+        exclude = exclude or []
         if fuzzy:
             terms = [fold_text(t) for t in terms]
+            exclude = [fold_text(t) for t in exclude]
         terms = [t for t in terms if t]
-        if not terms:
+        exclude = [t for t in exclude if t]
+        if not terms and not exclude:
             return []
         column = "norm" if fuzzy else "text"
-        where = " AND ".join([f"{column} LIKE ? ESCAPE '\\'"] * len(terms))
-        params = [self._like_param(t) for t in terms]
+        where = " AND ".join([f"{column} LIKE ? ESCAPE '\\'"] * len(terms)
+                             + [f"COALESCE({column}, '') NOT LIKE ? ESCAPE '\\'"] * len(exclude))
+        params = [self._like_param(t) for t in terms + exclude]
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT relpath, text FROM images WHERE {where}", params
@@ -1920,10 +1949,11 @@ EXPORT_FORMATS = {".csv": "csv", ".json": "json", ".txt": "txt"}
 
 
 def export_results(path: Path, rows: list[dict], *, folder: Path,
-                   terms: list[str] | None = None, fuzzy: bool = True) -> int:
+                   terms: list[str] | None = None, exclude: list[str] | None = None,
+                   fuzzy: bool = True) -> int:
     """
     登録内容（TextIndex.export_rows）を path の拡張子の形式で書き出し、件数を返す。
-    terms を渡すと検索結果として書き出す（ヒット箇所の列・検索条件が付く）。
+    terms・exclude（除いた語）を渡すと検索結果として書き出す（ヒット箇所の列・検索条件が付く）。
       CSV  … Excel 向け。1 ページ 1 行。UTF-8（BOM 付き。Excel で文字化けしない）
       JSON … すべての情報（吹き出しの位置・OCR エンジンなど）。別のプログラムで使う向け
       TXT  … 読む・文章を貼り付ける向け。ページ名と全文を順に並べる
@@ -1931,6 +1961,9 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
     fmt = EXPORT_FORMATS.get(path.suffix.lower())
     if fmt is None:
         raise ValueError(f"対応していない形式です: {path.suffix}（.csv / .json / .txt）")
+    exclude = exclude or []
+    searched = bool(terms or exclude)   # 検索結果の書き出し（索引全体ではない）
+    terms = terms or []
     items = []
     for row in rows:
         outer, member = split_relpath(row["relpath"])
@@ -1938,7 +1971,7 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
             "name": PurePosixPath(member).name if member else Path(outer).name,
             "archive": Path(outer).name if member else "",
             "location": display_path(row["relpath"]),
-            "snippet": make_snippet(row["text"], terms, fuzzy) if terms else "",
+            "snippet": make_snippet(row["text"], terms, fuzzy) if searched else "",
             **row,
         })
     exported_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1946,24 +1979,25 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
         import csv
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            header = ["画像名", "書庫名", "場所"] + (["ヒット箇所"] if terms else []) + ["全文", "OCR エンジン"]
+            header = ["画像名", "書庫名", "場所"] + (["ヒット箇所"] if searched else []) + ["全文", "OCR エンジン"]
             w.writerow(header)
             for it in items:
                 w.writerow([it["name"], it["archive"], it["location"]]
-                           + ([it["snippet"]] if terms else []) + [it["text"], it["engine"]])
+                           + ([it["snippet"]] if searched else []) + [it["text"], it["engine"]])
     elif fmt == "json":
         data = {
             "app": "KomaSagashi",
             "version": __version__,
             "exported_at": exported_at,
             "folder": str(folder),
-            "search": {"terms": terms, "ignore_variants": fuzzy} if terms else None,
+            "search": ({"terms": terms, "exclude": exclude, "ignore_variants": fuzzy}
+                       if searched else None),
             "count": len(items),
             "items": [{
                 "name": it["name"],
                 "archive": it["archive"] or None,
                 "relpath": it["relpath"],
-                **({"snippet": it["snippet"]} if terms else {}),
+                **({"snippet": it["snippet"]} if searched else {}),
                 "text": it["text"],
                 "lines": it["text"].splitlines(),
                 "engine": it["engine"],
@@ -1973,7 +2007,7 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     else:
-        title = (f"検索結果: {' '.join(terms)}（{len(items)} 件）" if terms
+        title = (f"検索結果: {format_query(terms, exclude)}（{len(items)} 件）" if searched
                  else f"索引全体（{len(items)} 件）")
         out = [f"KomaSagashi v{__version__} 書き出し", f"対象フォルダ: {folder}", title,
                f"書き出し日時: {exported_at}", "=" * 60, ""]
@@ -2453,6 +2487,7 @@ class ImageSearchApp:
         clean_tmp_dir()   # 前回の一時ファイルが残っていれば消す
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._last_terms: list[str] = []
+        self._last_exclude: list[str] = []   # -語 / !語 で除いた語
         self._last_fuzzy = True
         save_dir = self._settings.get("last_save_dir")
         self._last_save_dir: Path | None = Path(save_dir) if save_dir else None
@@ -2573,7 +2608,7 @@ class ImageSearchApp:
 
         f = ttk.Frame(tab)
         f.pack(fill="x", padx=8, pady=6)
-        ttk.Label(f, text="検索（スペース区切りで AND）:").pack(side="left")
+        ttk.Label(f, text="検索（スペース区切りで AND・-語 か !語 で除く）:").pack(side="left")
         self._query_var = tk.StringVar()
         self._query_entry = ttk.Entry(f, textvariable=self._query_var)
         self._query_entry.pack(side="left", fill="x", expand=True, padx=6)
@@ -2983,20 +3018,20 @@ class ImageSearchApp:
                 "先に「① インデックス作成」を実行してください。")
             return
 
-        terms = self._query_var.get().split()
+        terms, exclude = parse_query(self._query_var.get())   # -語 / !語 は除く
         fuzzy = bool(self._fuzzy_var.get())
-        self._last_terms, self._last_fuzzy = terms, fuzzy
+        self._last_terms, self._last_exclude, self._last_fuzzy = terms, exclude, fuzzy
         self._tree.delete(*self._tree.get_children())
         self._result_map.clear()
         self._clear_preview()
         self._export_hits_btn.state(["disabled"])
 
-        if not terms:
+        if not terms and not exclude:
             self._hit_var.set("")
             return
 
         try:
-            rows = index.search(terms, fuzzy=fuzzy)
+            rows = index.search(terms, fuzzy=fuzzy, exclude=exclude)
         except sqlite3.Error as exc:
             messagebox.showerror("エラー", f"検索に失敗しました:\n{exc}"); return
 
@@ -3036,10 +3071,10 @@ class ImageSearchApp:
         return path
 
     def _do_export(self, path: Path, rows: list[dict], index: TextIndex,
-                   terms: list[str] | None) -> None:
+                   terms: list[str] | None, exclude: list[str] | None = None) -> None:
         try:
             n = export_results(path, rows, folder=index.root, terms=terms,
-                               fuzzy=self._last_fuzzy)
+                               exclude=exclude, fuzzy=self._last_fuzzy)
         except Exception as exc:
             messagebox.showerror("エラー", f"書き出せませんでした:\n{exc}")
             return
@@ -3055,10 +3090,11 @@ class ImageSearchApp:
                     if iid in self._result_map]
         if index is None or not relpaths:
             return
-        path = self._ask_export_path(
-            export_file_name(f"検索結果_{' '.join(self._last_terms)}"))
+        path = self._ask_export_path(export_file_name(
+            f"検索結果_{format_query(self._last_terms, self._last_exclude)}"))
         if path:
-            self._do_export(path, index.export_rows(relpaths), index, self._last_terms)
+            self._do_export(path, index.export_rows(relpaths), index, self._last_terms,
+                            self._last_exclude)
 
     def _export_index(self) -> None:
         """① タブ: 対象フォルダの索引全体を書き出す。"""
