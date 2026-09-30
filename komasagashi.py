@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.12"
+__version__ = "1.13"
 
 import hashlib
 import importlib.util
@@ -2390,6 +2390,26 @@ class CropCanvas(tk.Canvas):
 # UI: メインアプリケーション
 # ════════════════════════════════════════════════════════════════════════
 
+def _on_screen(x: int, y: int, width: int) -> bool:
+    """
+    左上が (x, y)・幅 width のウィンドウのタイトルバーが、いまのモニターのどれかに見えるか。
+    複数モニターでは、主モニターの左や上のモニターの座標は負になる。
+    """
+    title = [(x + width // 2, y + 10), (x + 60, y + 10), (x + width - 60, y + 10)]
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.restype = wintypes.HMONITOR
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            # MONITOR_DEFAULTTONULL: どのモニターにも無い点なら NULL
+            return any(user32.MonitorFromPoint(wintypes.POINT(px, py), 0) for px, py in title)
+        except (AttributeError, OSError):
+            pass
+    return x > -width + 60 and y >= 0   # Windows 以外は大まかに（主モニターの左上より大きく外れていない）
+
+
 class ImageSearchApp:
     _POLL_MS = 100
     _PREVIEW_PLACEHOLDER = "（結果を選択すると画像を表示）"
@@ -2445,6 +2465,7 @@ class ImageSearchApp:
         self._show_hint = self._settings.get("show_crop_hint", True) is not False
 
         self._build_ui()
+        self._restore_window()
         self._show_start_message()
 
     # ── UI 構築 ───────────────────────────────────────────────────────
@@ -3402,7 +3423,56 @@ class ImageSearchApp:
             engine.close()   # PaddleOCR の子プロセスを終える
         self._close_preview_archive()
         clean_tmp_dir()   # 取り出した一時ファイル（開いているアプリがあれば消せずに次回起動時に消す）
+        self._save_window()
         self._root.destroy()
+
+    # ── ウィンドウの大きさ・位置の記憶 ─────────────────────────────────
+
+    _WINDOW_MIN = (600, 400)
+
+    def _restore_window(self) -> None:
+        """前回終了したときの大きさ・位置（最大化していたなら最大化）で開く。"""
+        saved = self._settings.get("window")
+        self._normal_geometry: str | None = None   # 最大化していないときの大きさ・位置
+        self._zoomed = False
+        if isinstance(saved, dict):
+            try:
+                w, h = int(saved["width"]), int(saved["height"])
+                x, y = int(saved["x"]), int(saved["y"])
+            except (KeyError, TypeError, ValueError):
+                w = 0
+            if w:
+                w, h = max(w, self._WINDOW_MIN[0]), max(h, self._WINDOW_MIN[1])
+                # モニターを外したなどで画面の外になる位置は使わない（大きさだけ戻す）
+                pos = f"+{x}+{y}" if _on_screen(x, y, w) else ""
+                self._root.geometry(f"{w}x{h}{pos}")
+                self._normal_geometry = f"{w}x{h}{pos or '+0+0'}"
+                self._zoomed = saved.get("maximized") is True
+                if self._zoomed:
+                    self._root.state("zoomed")
+        self._root.bind("<Configure>", self._on_root_configure, add="+")
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is not self._root:
+            return   # 子のウィジェットの大きさの変化
+        state = self._root.state()
+        if state == "normal":
+            self._normal_geometry = self._root.geometry()
+            self._zoomed = False
+        elif state == "zoomed":
+            self._zoomed = True
+
+    def _save_window(self) -> None:
+        state = self._root.state()
+        if state == "normal":
+            self._normal_geometry = self._root.geometry()
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", self._normal_geometry or "")
+        if not m:
+            return
+        self._settings.set("window", {
+            "width": int(m[1]), "height": int(m[2]),
+            "x": int(m[3].replace("+", "", 1)), "y": int(m[4].replace("+", "", 1)),
+            "maximized": state == "zoomed" or (state == "iconic" and self._zoomed)})
 
 
 # ════════════════════════════════════════════════════════════════════════
