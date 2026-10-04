@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.14"
+__version__ = "1.15"
 
 import hashlib
 import importlib.util
@@ -268,6 +268,111 @@ def migrate_legacy_index(folder: Path) -> bool:
         if extra.exists():
             shutil.move(str(extra), str(target.with_name(target.name + suffix)))
     return True
+
+
+def _db_files(db: Path) -> list[Path]:
+    """索引 DB 本体と、SQLite が横に作る作業ファイル（あれば）。"""
+    return [db] + [p for p in (db.with_name(db.name + s) for s in ("-journal", "-wal", "-shm"))
+                   if p.exists()]
+
+
+@dataclass
+class IndexInfo:
+    """③ 索引の一覧の 1 行（data/indexes/ の DB 1 つ）。"""
+    db: Path
+    root: Path | None          # 索引を作ったフォルダ（DB に記録した場所。読めなければ None）
+    count: int | None          # 登録ページ数（読めなければ None）
+    updated: float             # DB の更新日時
+
+    @property
+    def folder_exists(self) -> bool:
+        return self.root is not None and self.root.is_dir()
+
+    @property
+    def name_matches(self) -> bool:
+        """DB のファイル名が記録した場所と合っている（＝そのフォルダを開くとこの索引が使われる）。"""
+        return self.root is not None and _folder_key(index_path_for(self.root)) == _folder_key(self.db)
+
+
+def list_indexes() -> list[IndexInfo]:
+    """data/indexes/ にある索引をフォルダ名の順に返す。"""
+    infos = []
+    for db in sorted(INDEX_DIR.glob("*.db"), key=lambda p: _natural_sort_key(p.name)):
+        root = count = None
+        try:
+            # 一覧を見るだけで DB を書き換えないよう読み取り専用で開く
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                row = conn.execute("SELECT value FROM meta WHERE key = 'root'").fetchone()
+                root = Path(row[0]) if row and row[0] else None
+                count = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError, ValueError):
+            pass
+        try:
+            updated = db.stat().st_mtime
+        except OSError:
+            updated = 0.0
+        infos.append(IndexInfo(db, root, count, updated))
+    return sorted(infos, key=lambda i: _natural_sort_key(i.root.name if i.root else i.db.stem))
+
+
+def count_found(db: Path, folder: Path, limit: int = 300) -> tuple[int, int]:
+    """
+    索引に登録した画像（書庫なら書庫ファイル）が folder の中にいくつあるか。
+    (見つかった数, 調べた数) を返す。フォルダを移動したときの付け替え先の確認に使う。
+    多いときは間引いて limit 個まで調べる（ネットワーク上のフォルダでも待たせないため）。
+    """
+    conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        rels = [r[0] for r in conn.execute("SELECT relpath FROM images")]
+    finally:
+        conn.close()
+    outers = sorted({split_relpath(r)[0] for r in rels}, key=_natural_sort_key)
+    if len(outers) > limit:
+        step = len(outers) / limit
+        outers = [outers[int(i * step)] for i in range(limit)]
+    return sum((folder / o).exists() for o in outers), len(outers)
+
+
+def relink_index(db: Path, new_root: Path) -> Path:
+    """
+    索引 db を new_root の索引として付け替える（DB のファイル名と記録した場所を変える）。
+    画像は相対パスで記録してあるので、フォルダを移動・改名しても OCR し直さずに使える。
+    付け替え先に別の索引があれば FileExistsError。新しい DB の場所を返す。
+    """
+    target = index_path_for(new_root)
+    if _folder_key(target) != _folder_key(db):
+        if target.exists():
+            raise FileExistsError(str(target))
+        for src in _db_files(db):
+            shutil.move(str(src), str(target.with_name(target.name + src.name[len(db.name):])))
+    TextIndex(new_root).count()   # 開くと meta の root が新しい場所に書き換わる
+    return target
+
+
+def send_to_trash(paths: list[Path]) -> None:
+    """ファイルをごみ箱へ移す（Windows のみ。失敗したら OSError）。"""
+    if os.name != "nt":
+        raise OSError("ごみ箱への移動は Windows でのみ対応しています")
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 4, 16, 64, 1024
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = "".join(str(p.resolve()) + "\0" for p in paths) + "\0"
+    op.fFlags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if result != 0 or op.fAnyOperationsAborted:
+        raise OSError(f"ごみ箱へ移せませんでした（コード {result}）")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1918,6 +2023,20 @@ class Settings:
         self._data["recent_folders"] = [path] + rest[: self._MAX_RECENT - 1]
         self._save()
 
+    def rename_recent_folder(self, old: Path, new: Path) -> None:
+        """索引を付け替えたとき、▼ の一覧の場所も同じ並び順のまま新しい場所にする。"""
+        def key(f) -> str:
+            return os.path.normcase(os.path.abspath(str(f)))
+        new_key = key(new)
+        folders = [f for f in self._data.get("recent_folders", [])
+                   if isinstance(f, str) and key(f) != new_key]
+        if any(key(f) == key(old) for f in folders):
+            self._data["recent_folders"] = [str(new) if key(f) == key(old) else f
+                                            for f in folders]
+            self._save()
+        else:
+            self.add_recent_folder(new)
+
     def get(self, key: str, default=None):
         return self._data.get(key, default)
 
@@ -1948,12 +2067,14 @@ def format_percent(scale: float) -> str:
 EXPORT_FORMATS = {".csv": "csv", ".json": "json", ".txt": "txt"}
 
 
-def export_results(path: Path, rows: list[dict], *, folder: Path,
+def export_results(path: Path, rows: list[dict], *, folder: Path | list[Path],
                    terms: list[str] | None = None, exclude: list[str] | None = None,
                    fuzzy: bool = True) -> int:
     """
     登録内容（TextIndex.export_rows）を path の拡張子の形式で書き出し、件数を返す。
     terms・exclude（除いた語）を渡すと検索結果として書き出す（ヒット箇所の列・検索条件が付く）。
+    folder に複数のフォルダを渡すと（複数の索引をまとめて検索した結果）、各行の
+    "folder"（そのページの対象フォルダ）も書き出す。
       CSV  … Excel 向け。1 ページ 1 行。UTF-8（BOM 付き。Excel で文字化けしない）
       JSON … すべての情報（吹き出しの位置・OCR エンジンなど）。別のプログラムで使う向け
       TXT  … 読む・文章を貼り付ける向け。ページ名と全文を順に並べる
@@ -1964,6 +2085,8 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
     exclude = exclude or []
     searched = bool(terms or exclude)   # 検索結果の書き出し（索引全体ではない）
     terms = terms or []
+    folders = [Path(f) for f in folder] if isinstance(folder, list) else [Path(folder)]
+    multi = len(folders) > 1
     items = []
     for row in rows:
         outer, member = split_relpath(row["relpath"])
@@ -1973,27 +2096,32 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
             "location": display_path(row["relpath"]),
             "snippet": make_snippet(row["text"], terms, fuzzy) if searched else "",
             **row,
+            "folder": str(row.get("folder") or folders[0]),
         })
     exported_at = time.strftime("%Y-%m-%d %H:%M:%S")
     if fmt == "csv":
         import csv
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            header = ["画像名", "書庫名", "場所"] + (["ヒット箇所"] if searched else []) + ["全文", "OCR エンジン"]
+            header = ((["フォルダ"] if multi else []) + ["画像名", "書庫名", "場所"]
+                      + (["ヒット箇所"] if searched else []) + ["全文", "OCR エンジン"])
             w.writerow(header)
             for it in items:
-                w.writerow([it["name"], it["archive"], it["location"]]
+                w.writerow(([it["folder"]] if multi else [])
+                           + [it["name"], it["archive"], it["location"]]
                            + ([it["snippet"]] if searched else []) + [it["text"], it["engine"]])
     elif fmt == "json":
         data = {
             "app": "KomaSagashi",
             "version": __version__,
             "exported_at": exported_at,
-            "folder": str(folder),
+            # 複数の索引をまとめて検索した結果なら、フォルダの一覧（各ページの folder も付く）
+            "folder": [str(f) for f in folders] if multi else str(folders[0]),
             "search": ({"terms": terms, "exclude": exclude, "ignore_variants": fuzzy}
                        if searched else None),
             "count": len(items),
             "items": [{
+                **({"folder": it["folder"]} if multi else {}),
                 "name": it["name"],
                 "archive": it["archive"] or None,
                 "relpath": it["relpath"],
@@ -2009,10 +2137,12 @@ def export_results(path: Path, rows: list[dict], *, folder: Path,
     else:
         title = (f"検索結果: {format_query(terms, exclude)}（{len(items)} 件）" if searched
                  else f"索引全体（{len(items)} 件）")
-        out = [f"KomaSagashi v{__version__} 書き出し", f"対象フォルダ: {folder}", title,
+        out = [f"KomaSagashi v{__version__} 書き出し",
+               *(f"対象フォルダ: {f}" for f in folders), title,
                f"書き出し日時: {exported_at}", "=" * 60, ""]
         for it in items:
-            out.append(f"■ {it['name']}" + (f"（{it['archive']}）" if it["archive"] else ""))
+            out.append(f"■ {it['name']}" + (f"（{it['archive']}）" if it["archive"] else "")
+                       + (f" ［{Path(it['folder']).name}］" if multi else ""))
             out.append(it["text"] if it["text"].strip() else "（文字なし）")
             out.append("")
         path.write_text("\n".join(out), encoding="utf-8")
@@ -2480,6 +2610,10 @@ class ImageSearchApp:
 
         # 検索結果 iid → (絶対パス, 全文, 相対パス) の対応
         self._result_map: dict[str, tuple[Path, str, str]] = {}   # iid → (対象フォルダ, 全文, relpath)
+        # ③ 索引の一覧で複数選んだ索引のフォルダ（先頭は対象フォルダ欄と同じ）。1 つなら None
+        self._multi_roots: list[Path] | None = None
+        self._index_cache: dict[str, TextIndex] = {}   # フォルダ → 索引（検索・プレビュー用）
+        self._list_infos: dict[str, IndexInfo] = {}    # ③ の一覧の iid → 索引の情報
         self._preview_reader: ArchiveReader | None = None           # プレビュー中の書庫
         self._view: tuple[Path, str] | None = None    # プレビュー中のページ（対象フォルダ, relpath）
         self._origin: str | None = None               # 一覧で選んだページ（前後に動かす前）
@@ -2488,6 +2622,7 @@ class ImageSearchApp:
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._last_terms: list[str] = []
         self._last_exclude: list[str] = []   # -語 / !語 で除いた語
+        self._last_roots: list[Path] = []    # 最後に検索したフォルダ（複数の索引をまとめて検索したなら全部）
         self._last_fuzzy = True
         save_dir = self._settings.get("last_save_dir")
         self._last_save_dir: Path | None = Path(save_dir) if save_dir else None
@@ -2529,6 +2664,8 @@ class ImageSearchApp:
         self._nb.pack(fill="both", expand=True, **pad)
         self._build_index_tab()
         self._build_search_tab()
+        self._build_list_tab()
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_index_tab(self) -> None:
         tab = ttk.Frame(self._nb)
@@ -2630,12 +2767,16 @@ class ImageSearchApp:
         # 左: 結果一覧
         left = ttk.Frame(paned)
         paned.add(left, weight=1)
-        cols = ("file", "snippet")
-        self._tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
+        # フォルダの列は、複数の索引をまとめて検索したときだけ出す（displaycolumns）
+        cols = ("file", "snippet", "folder")
+        self._tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse",
+                                  displaycolumns=("file", "snippet"))
         self._tree.heading("file", text="ファイル")
         self._tree.heading("snippet", text="ヒット箇所")
+        self._tree.heading("folder", text="フォルダ")
         self._tree.column("file", width=180, anchor="w")
         self._tree.column("snippet", width=240, anchor="w")
+        self._tree.column("folder", width=110, anchor="w")
         vsb = ttk.Scrollbar(left, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
@@ -2761,6 +2902,48 @@ class ImageSearchApp:
         self._fulltext.pack(fill="x", padx=4, pady=(0, 4))
         self._fulltext.tag_configure("hit", background="yellow")
 
+    def _build_list_tab(self) -> None:
+        tab = ttk.Frame(self._nb)
+        self._nb.add(tab, text="③ 索引の一覧")
+
+        ttk.Label(tab, foreground="gray", justify="left", wraplength=900, text=(
+            "クリックで選ぶと、そのフォルダが対象フォルダになります。"
+            "Ctrl・Shift+クリックで複数選ぶと、② 検索で選んだ索引をまとめて検索します（ダブルクリックで ② へ）。\n"
+            "フォルダを移動・改名したときは「場所を変更…」で新しい場所を選ぶと、読み取りをやり直さずに使えます。")
+                  ).pack(fill="x", padx=8, pady=(6, 2))
+
+        btns = ttk.Frame(tab)
+        btns.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
+        ttk.Button(btns, text="② 選んだ索引で検索", command=self._search_selected).pack(
+            side="left", padx=2)
+        ttk.Button(btns, text="場所を変更（移動・改名したとき）…",
+                   command=self._relink_selected).pack(side="left", padx=2)
+        ttk.Button(btns, text="フォルダを開く", command=self._open_list_folder).pack(
+            side="left", padx=2)
+        ttk.Button(btns, text="索引を削除（ごみ箱へ）…", command=self._delete_selected).pack(
+            side="left", padx=2)
+        ttk.Button(btns, text="一覧を更新", command=self._refresh_list).pack(side="right", padx=2)
+
+        f = ttk.Frame(tab)
+        f.pack(fill="both", expand=True, padx=8, pady=4)
+        cols = ("name", "count", "state", "updated", "folder", "db")
+        self._list = ttk.Treeview(f, columns=cols, show="headings", selectmode="extended")
+        for col, text, width, anchor, stretch in (
+                ("name", "フォルダ名", 150, "w", False), ("count", "ページ数", 70, "e", False),
+                ("state", "状態", 150, "w", False), ("updated", "更新日時", 120, "w", False),
+                ("folder", "フォルダの場所", 330, "w", True),
+                ("db", "索引ファイル（data\\indexes）", 190, "w", False)):
+            self._list.heading(col, text=text)
+            self._list.column(col, width=width, anchor=anchor, stretch=stretch)
+        self._list.tag_configure("missing", foreground="#c01c28")
+        vsb = ttk.Scrollbar(f, orient="vertical", command=self._list.yview)
+        self._list.configure(yscrollcommand=vsb.set)
+        self._list.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._list.bind("<<TreeviewSelect>>", lambda _e: self._on_list_select())
+        self._list.bind("<Double-1>", lambda e: self._search_selected()
+                        if self._list.identify_row(e.y) else None)
+
     # ── フォルダ / DB ─────────────────────────────────────────────────
 
     def _folder_or_none(self) -> Path | None:
@@ -2782,6 +2965,24 @@ class ImageSearchApp:
                 "このフォルダは新しく索引を作ることになります。")
         return TextIndex(folder)
 
+    def _index_for(self, root: Path) -> TextIndex:
+        """検索・プレビュー用に、フォルダの索引を使い回す（索引が消えていれば作り直す）。"""
+        key = _folder_key(root)
+        index = self._index_cache.get(key)
+        if index is None or not index.exists():
+            index = self._index_cache[key] = TextIndex(root)
+        return index
+
+    def _search_roots(self) -> list[Path]:
+        """② で検索するフォルダ。③ で複数選んでいればそのすべて、でなければ対象フォルダだけ。"""
+        folder = self._folder_or_none()
+        if folder is None:
+            return []
+        # 対象フォルダ欄を別のフォルダに変えたら、複数選んだ状態は使わない
+        if self._multi_roots and _folder_key(self._multi_roots[0]) == _folder_key(folder):
+            return list(self._multi_roots)
+        return [folder]
+
     def _select_folder(self) -> None:
         current = self._folder_var.get().strip()
         path = filedialog.askdirectory(
@@ -2797,6 +2998,7 @@ class ImageSearchApp:
         self._folder_box["values"] = self._settings.recent_folders()
 
     def _on_folder_changed(self) -> None:
+        self._multi_roots = None   # フォルダを選び直したら、その 1 つだけを検索する
         self._refresh_index_status()
         index = self._index_or_none()
         if index is not None and index.exists():
@@ -2809,7 +3011,7 @@ class ImageSearchApp:
         """起動時は対象フォルダを空欄にし、▼ から前に使ったフォルダを選べることを案内する。"""
         if self._settings.recent_folders():
             self._index_status_var.set(
-                "対象フォルダを選んでください（▼ から前にインデックスを作ったフォルダを選ぶと、すぐ検索できます）")
+                "対象フォルダを選んでください（▼ か ③ 索引の一覧から、前にインデックスを作ったフォルダを選ぶと、すぐ検索できます）")
         else:
             self._index_status_var.set("対象フォルダを選んでください")
 
@@ -2817,6 +3019,20 @@ class ImageSearchApp:
         self._migrated_note = ""
         if self._folder_or_none() is None:
             self._show_start_message()
+            return
+        roots = self._search_roots()
+        if len(roots) > 1:
+            parts = []
+            for root in roots:
+                index = self._index_for(root)
+                try:
+                    parts.append(f"{root.name}（{index.count()} 件）" if index.exists()
+                                 else f"{root.name}（索引なし）")
+                except sqlite3.Error:
+                    parts.append(f"{root.name}（読み込みエラー）")
+            self._index_status_var.set(
+                f"検索対象: {len(roots)} 個の索引 … " + "・".join(parts)
+                + f"　※ ① の作成/更新は {roots[0].name} が対象")
             return
         index = self._index_or_none()
         if index is not None and index.exists():
@@ -3007,44 +3223,56 @@ class ImageSearchApp:
 
     # ── 検索 ──────────────────────────────────────────────────────────
 
-    def _run_search(self) -> None:
-        index = self._index_or_none()
-        if index is None:
-            messagebox.showerror("エラー", "対象フォルダを指定してください。"); return
-        if not index.exists():
-            messagebox.showwarning(
-                "インデックスなし",
-                "このフォルダにはインデックスがありません。\n"
-                "先に「① インデックス作成」を実行してください。")
-            return
-
-        terms, exclude = parse_query(self._query_var.get())   # -語 / !語 は除く
-        fuzzy = bool(self._fuzzy_var.get())
-        self._last_terms, self._last_exclude, self._last_fuzzy = terms, exclude, fuzzy
+    def _clear_results(self) -> None:
         self._tree.delete(*self._tree.get_children())
         self._result_map.clear()
         self._clear_preview()
         self._export_hits_btn.state(["disabled"])
+        self._hit_var.set("")
+
+    def _run_search(self) -> None:
+        roots = self._search_roots()
+        if not roots:
+            messagebox.showerror("エラー", "対象フォルダを指定してください。"); return
+        if len(roots) == 1:
+            index = self._index_or_none()   # 旧版の索引が画像フォルダ内にあれば先に移す
+            if index is not None and not index.exists():
+                messagebox.showwarning(
+                    "インデックスなし",
+                    "このフォルダにはインデックスがありません。\n"
+                    "先に「① インデックス作成」を実行してください。")
+                return
+        # 複数なら、索引が見つからないもの（削除した・場所が変わった）は飛ばす
+        indexes = [i for i in (self._index_for(r) for r in roots) if i.exists()]
+
+        terms, exclude = parse_query(self._query_var.get())   # -語 / !語 は除く
+        fuzzy = bool(self._fuzzy_var.get())
+        self._last_terms, self._last_exclude, self._last_fuzzy = terms, exclude, fuzzy
+        self._clear_results()
+        self._last_roots = roots
+        multi = len(roots) > 1
+        self._tree["displaycolumns"] = ("folder", "file", "snippet") if multi else ("file", "snippet")
 
         if not terms and not exclude:
-            self._hit_var.set("")
             return
 
-        try:
-            rows = index.search(terms, fuzzy=fuzzy, exclude=exclude)
-        except sqlite3.Error as exc:
-            messagebox.showerror("エラー", f"検索に失敗しました:\n{exc}"); return
+        total = 0
+        for index in indexes:
+            try:
+                rows = index.search(terms, fuzzy=fuzzy, exclude=exclude)
+            except sqlite3.Error as exc:
+                messagebox.showerror("エラー", f"検索に失敗しました（{index.root.name}）:\n{exc}")
+                return
+            for relpath, text in rows:
+                iid = self._tree.insert(
+                    "", "end",
+                    values=(display_name(relpath), make_snippet(text, terms, fuzzy),
+                            index.root.name))
+                self._result_map[iid] = (index.root, text, relpath)
+            total += len(rows)
 
-        for relpath, text in rows:
-            iid = self._tree.insert(
-                "", "end",
-                values=(display_name(relpath), make_snippet(text, terms, fuzzy)))
-            self._result_map[iid] = (index.root, text, relpath)
-
-        self._hit_var.set(f"ヒット: {len(rows)} 件")
-        if not rows:
-            self._hit_var.set("ヒット: 0 件")
-        else:
+        self._hit_var.set(f"ヒット: {total} 件")
+        if total:
             self._export_hits_btn.state(["!disabled"])
 
     # ── 書き出し ──────────────────────────────────────────────────────
@@ -3070,10 +3298,10 @@ class ImageSearchApp:
         self._settings.set("last_export_dir", str(path.parent))
         return path
 
-    def _do_export(self, path: Path, rows: list[dict], index: TextIndex,
+    def _do_export(self, path: Path, rows: list[dict], folder: Path | list[Path],
                    terms: list[str] | None, exclude: list[str] | None = None) -> None:
         try:
-            n = export_results(path, rows, folder=index.root, terms=terms,
+            n = export_results(path, rows, folder=folder, terms=terms,
                                exclude=exclude, fuzzy=self._last_fuzzy)
         except Exception as exc:
             messagebox.showerror("エラー", f"書き出せませんでした:\n{exc}")
@@ -3085,16 +3313,33 @@ class ImageSearchApp:
 
     def _export_hits(self) -> None:
         """② 検索タブ: いまの検索結果（一覧の順）を書き出す。"""
-        index = self._index_or_none()
-        relpaths = [self._result_map[iid][2] for iid in self._tree.get_children()
-                    if iid in self._result_map]
-        if index is None or not relpaths:
+        entries = [self._result_map[iid] for iid in self._tree.get_children()
+                   if iid in self._result_map]
+        if not entries:
             return
         path = self._ask_export_path(export_file_name(
             f"検索結果_{format_query(self._last_terms, self._last_exclude)}"))
-        if path:
-            self._do_export(path, index.export_rows(relpaths), index, self._last_terms,
-                            self._last_exclude)
+        if not path:
+            return
+        roots = {_folder_key(root): root for root, _text, _rel in entries}   # 一覧の順
+        try:
+            by_root = {key: {row["relpath"]: row for row in self._index_for(root).export_rows(
+                [rel for r, _t, rel in entries if _folder_key(r) == key])}
+                for key, root in roots.items()}
+        except sqlite3.Error as exc:
+            messagebox.showerror("エラー", f"書き出せませんでした:\n{exc}"); return
+        multi = len(self._last_roots) > 1
+        rows = []
+        for root, _text, rel in entries:
+            row = by_root[_folder_key(root)].get(rel)
+            if row is not None:
+                rows.append({**row, "folder": str(root)})
+        folders = list(roots.values())
+        if multi:
+            # ヒットしなかった索引も、検索したフォルダとして書き出す
+            folders += [r for r in self._last_roots if _folder_key(r) not in roots]
+        self._do_export(path, rows, folders if multi else folders[0], self._last_terms,
+                        self._last_exclude)
 
     def _export_index(self) -> None:
         """① タブ: 対象フォルダの索引全体を書き出す。"""
@@ -3108,12 +3353,12 @@ class ImageSearchApp:
             return
         path = self._ask_export_path(export_file_name(f"索引_{index.root.name}"))
         if path:
-            self._do_export(path, index.export_rows(), index, None)
+            self._do_export(path, index.export_rows(), index.root, None)
 
     def _on_fuzzy_changed(self) -> None:
         self._settings.set("fuzzy_search", bool(self._fuzzy_var.get()))
-        index = self._index_or_none()
-        if self._query_var.get().strip() and index is not None and index.exists():
+        if (self._query_var.get().strip()
+                and any(self._index_for(r).exists() for r in self._search_roots())):
             self._run_search()
 
     def _current_entry(self) -> tuple[Path, str] | None:
@@ -3195,9 +3440,9 @@ class ImageSearchApp:
         if not 0 <= i < len(pages):
             return
         root, relpath = self._view[0], pages[i]
-        index = self._index_or_none()
+        index = self._index_for(root)
         try:
-            text = index.get_text(relpath) if index is not None and index.root == root else None
+            text = index.get_text(relpath) if index.exists() else None
         except sqlite3.Error:
             text = None
         self._show_page(root, relpath, text)
@@ -3234,9 +3479,9 @@ class ImageSearchApp:
             return
 
         panels = detect_panels(img)
-        index = self._index_or_none()
+        index = self._index_for(root)   # 複数の索引を検索したときは、そのページの索引
         try:
-            blocks = index.get_blocks(relpath) if index else None
+            blocks = index.get_blocks(relpath) if index.exists() else None
         except (sqlite3.Error, ValueError):
             blocks = None
 
@@ -3270,6 +3515,185 @@ class ImageSearchApp:
         self._fulltext.config(state="normal")
         self._fulltext.delete("1.0", "end")
         self._fulltext.config(state="disabled")
+
+    # ── 索引の一覧 ────────────────────────────────────────────────────
+
+    def _on_tab_changed(self, _event=None) -> None:
+        if self._nb.index("current") == 2:
+            self._refresh_list()
+
+    def _refresh_list(self, select: list[Path] | None = None) -> None:
+        """③ の一覧を作り直し、検索対象（または select）のフォルダの行を選んだ状態にする。"""
+        targets = {_folder_key(p) for p in (select if select is not None else self._search_roots())}
+        self._list.delete(*self._list.get_children())
+        self._list_infos.clear()
+        chosen = []
+        for info in list_indexes():
+            if info.count is None:
+                state = "読み込めません"
+            elif info.root is None:
+                state = "場所が不明（場所を変更で指定）"
+            elif not info.folder_exists:
+                state = "フォルダが見つかりません"
+            elif not info.name_matches:
+                state = "場所を変更で付け替えてください"
+            else:
+                state = "使えます"
+            iid = self._list.insert("", "end", tags=() if state == "使えます" else ("missing",),
+                                    values=(info.root.name if info.root else info.db.stem,
+                                            "" if info.count is None else info.count, state,
+                                            time.strftime("%Y-%m-%d %H:%M",
+                                                          time.localtime(info.updated)),
+                                            str(info.root) if info.root else "（不明）",
+                                            info.db.name))
+            self._list_infos[iid] = info
+            if info.root is not None and _folder_key(info.root) in targets:
+                chosen.append(iid)
+        self._list.selection_set(chosen)
+        if chosen:
+            self._list.see(chosen[0])
+
+    def _selected_infos(self) -> list[IndexInfo]:
+        return [self._list_infos[i] for i in self._list.selection() if i in self._list_infos]
+
+    def _on_list_select(self) -> None:
+        """一覧で選んだ索引を検索対象にする（1 つなら対象フォルダ、複数ならまとめて検索）。"""
+        roots = [i.root for i in self._selected_infos() if i.root is not None]
+        if not roots:
+            return
+        if [_folder_key(r) for r in roots] == [_folder_key(r) for r in self._search_roots()]:
+            return   # 一覧を作り直して選び直しただけ
+        self._multi_roots = roots if len(roots) > 1 else None
+        self._folder_var.set(str(roots[0]))
+        self._refresh_index_status()
+
+    def _search_selected(self) -> None:
+        """一覧で選んだ索引を ② で検索する（検索語が入っていればすぐ検索）。"""
+        if not self._selected_infos():
+            messagebox.showinfo("索引の一覧", "検索する索引を選んでください。")
+            return
+        self._on_list_select()
+        self._nb.select(1)
+        self._query_entry.focus_set()
+        if self._query_var.get().strip():
+            self._run_search()
+
+    def _busy_for_list(self) -> bool:
+        if self._is_processing:
+            messagebox.showinfo("インデックス作成中",
+                                "インデックス作成が終わってから（または停止してから）操作してください。")
+        return self._is_processing
+
+    def _relink_selected(self) -> None:
+        """移動・改名したフォルダに索引を付け替える（OCR し直さずに使えるようにする）。"""
+        infos = self._selected_infos()
+        if len(infos) != 1:
+            messagebox.showinfo("場所を変更", "付け替える索引を 1 つだけ選んでください。")
+            return
+        if self._busy_for_list():
+            return
+        info = infos[0]
+        name = info.root.name if info.root else info.db.stem
+        initial = None
+        if info.root is not None and info.root.parent.is_dir():
+            initial = str(info.root.parent)
+        path = filedialog.askdirectory(
+            title=f"「{name}」の新しい場所（移動・改名した後のフォルダ）を選択", initialdir=initial)
+        if not path:
+            return
+        new_root = Path(path)
+        if (info.root is not None and _folder_key(new_root) == _folder_key(info.root)
+                and info.name_matches):
+            messagebox.showinfo("場所を変更", "今と同じ場所です。")
+            return
+        try:
+            found, checked = count_found(info.db, new_root)
+        except (sqlite3.Error, OSError) as exc:
+            messagebox.showerror("エラー", f"索引を読み込めませんでした:\n{exc}")
+            return
+        if checked and found == 0:
+            if not messagebox.askyesno(
+                    "画像が見つかりません",
+                    f"選んだフォルダに、この索引に登録された画像が 1 つも見つかりません。\n{new_root}\n\n"
+                    "別のフォルダかもしれません。それでも付け替えますか？", icon="warning"):
+                return
+        elif found < checked:
+            if not messagebox.askyesno(
+                    "一部の画像が見つかりません",
+                    f"索引に登録された画像（書庫）を {checked} 個調べ、{found} 個が見つかりました。\n"
+                    "見つからない分は、次の「インデックス作成/更新」で索引から外れます。\n\n"
+                    "付け替えますか？"):
+                return
+        try:
+            relink_index(info.db, new_root)
+        except FileExistsError:
+            messagebox.showwarning(
+                "付け替えられません",
+                f"新しい場所には別の索引がすでにあります。\n{new_root}\n\n"
+                "一覧でその索引を削除してから、もう一度付け替えてください。")
+            return
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror("エラー", f"付け替えられませんでした:\n{exc}")
+            return
+        self._index_cache.clear()
+        self._clear_results()   # 一覧の結果は元の場所を指しているので消す
+        old = info.root
+        if old is not None:
+            self._settings.rename_recent_folder(old, new_root)
+            folder = self._folder_or_none()
+            if folder is not None and _folder_key(folder) == _folder_key(old):
+                self._folder_var.set(str(new_root))
+            if self._multi_roots:
+                self._multi_roots = [new_root if _folder_key(r) == _folder_key(old) else r
+                                     for r in self._multi_roots]
+        else:
+            self._settings.add_recent_folder(new_root)
+        self._refresh_list()
+        self._refresh_index_status()
+        messagebox.showinfo(
+            "付け替えました",
+            f"索引を新しい場所で使えるようにしました。\n{new_root}\n\n"
+            "移動したあとに増えた・変わった画像があれば、① の「インデックス作成/更新」で反映されます。")
+
+    def _open_list_folder(self) -> None:
+        infos = self._selected_infos()
+        if not infos:
+            return
+        info = infos[0]
+        if not info.folder_exists:
+            messagebox.showwarning(
+                "フォルダが見つかりません",
+                f"フォルダが見つかりません:\n{info.root or '（場所が不明）'}\n\n"
+                "移動・改名したときは「場所を変更…」で新しい場所を選んでください。")
+            return
+        if os.name == "nt":
+            os.startfile(str(info.root))   # type: ignore[attr-defined]
+        else:
+            subprocess.run(["xdg-open", str(info.root)])
+
+    def _delete_selected(self) -> None:
+        """選んだ索引をごみ箱へ移す（画像フォルダの中身はそのまま）。"""
+        infos = self._selected_infos()
+        if not infos or self._busy_for_list():
+            return
+        names = "\n".join(f"・{i.root.name if i.root else i.db.stem}"
+                          f"（{i.count if i.count is not None else '?'} ページ）" for i in infos)
+        if not messagebox.askyesno(
+                "索引を削除",
+                f"次の索引を削除しますか？\n{names}\n\n"
+                "画像フォルダの中の画像は消えません。索引ファイルはごみ箱に移すので、"
+                "ごみ箱から元に戻せます（戻さずにまた検索するには、読み取りのやり直しが必要です）。",
+                icon="warning"):
+            return
+        try:
+            send_to_trash([p for i in infos for p in _db_files(i.db)])
+        except OSError as exc:
+            messagebox.showerror("エラー", f"削除できませんでした:\n{exc}")
+            return
+        self._index_cache.clear()
+        self._clear_results()
+        self._refresh_list()
+        self._refresh_index_status()
 
     # ── 切り抜き ──────────────────────────────────────────────────────
 
