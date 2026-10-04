@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.17"
+__version__ = "1.18"
 
 import hashlib
 import importlib.util
@@ -2699,7 +2699,29 @@ class ImageSearchApp:
 
     # ── UI 構築 ───────────────────────────────────────────────────────
 
+    def _style_tabs(self) -> None:
+        """
+        選んでいるタブを青地・白の太字にする。Windows 標準の見た目（vista）のタブは
+        色を変えられないので、タブの部品だけ色を指定できる default の見た目から借りる。
+        """
+        style = ttk.Style()
+        if "Koma.Notebook.tab" not in style.element_names():
+            style.element_create("Koma.Notebook.tab", "from", "default")
+        style.layout("TNotebook.Tab", [("Koma.Notebook.tab", {"sticky": "nswe", "children": [
+            ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        self._tab_font = bold   # 参照を持っておく（消えると太字にならない）
+        style.configure("TNotebook.Tab", padding=(14, 4), borderwidth=1,
+                        background="#e4e4e4", foreground="#333333", font=bold)
+        style.map("TNotebook.Tab",
+                  background=[("selected", "#1a5fb4"), ("active", "#cfdcf0")],
+                  foreground=[("selected", "#ffffff")],
+                  expand=[("selected", (0, 2, 0, 0))])
+
     def _build_ui(self) -> None:
+        self._style_tabs()
         # タブは 検索・インデックス作成・索引 の順（_TAB_SEARCH などと合わせる）
         self._nb = ttk.Notebook(self._root)
         self._nb.pack(fill="both", expand=True, padx=8, pady=4)
