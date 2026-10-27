@@ -14,7 +14,7 @@ OCR 結果をファイル名に埋め込む方式と違い、全文を SQLite �
     クリップボードへコピー・画像で保存できる（出力倍率を指定可、プレビューは拡大縮小可）
   ・一度インデックスを作ったフォルダを記憶し、次回は一覧から選べる
   ・（任意）横書きの文字しかないページ（目次・扉など）を PaddleOCR で読み直す
-  ・検索で表記ゆれ（カタカナ/ひらがな・濁点・全角/半角など）を無視できる
+  ・検索で表記ゆれ（カタカナ/ひらがな・濁点・全角/半角など）を無視できる。正規表現でも探せる
   ・フォルダ内の書庫（zip / cbz / rar / cbr / 7z / cb7）の中の画像も、取り出さずに検索できる
 OCR エンジンは mokuro / manga-ocr-base を使用する。
 コマの検出は OpenCV による画像処理（コマ間の白い隙間を手がかりにする）。
@@ -26,7 +26,7 @@ OCR エンジンは mokuro / manga-ocr-base を使用する。
 from __future__ import annotations
 
 # 修正・機能追加のたびに 0.01 ずつ上げる。変更内容は CHANGELOG.md に書く。
-__version__ = "1.18"
+__version__ = "1.19"
 
 import hashlib
 import importlib.util
@@ -466,15 +466,96 @@ def fold_with_map(text: str) -> tuple[str, list[int]]:
     return "".join(chars), origin
 
 
-def find_terms(text: str, terms: list[str], fuzzy: bool) -> list[tuple[int, int]]:
+def _fold_pattern_char(ch: str, in_class: bool) -> str:
+    """正規表現の中の 1 文字（ASCII 以外）を fold_text と同じ形にし、普通の文字として書く。"""
+    folded = _fold_char(ch)
+    if folded == ch:
+        return ch
+    escaped = re.escape(folded)   # （ → ( のように記号になっても、書き方としては扱わない
+    if in_class or len(folded) == 1:
+        return escaped
+    return f"(?:{escaped})"       # 2 文字以上・0 文字になる文字も、後ろの * や + が 1 文字分に効くように
+
+
+def fold_pattern(pattern: str) -> str:
+    """
+    正規表現の検索語に fold_text と同じ変換をする（表記ゆれを無視して正規表現で探すとき）。
+    ASCII の文字（. * [ ] ( ) \\d などの書き方）はそのまま。大文字小文字は re.IGNORECASE で無視する。
+    ただし - と ~ は（文字の範囲 [あ-ん] の - を除き）長音「ー」として扱う。
+    """
+    out: list[str] = []
+    in_class = False
+    class_start = -1   # [ の直後（] や ^ を文字として書ける位置）
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            nxt = pattern[i + 1]
+            if nxt in "-~":
+                out.append("ー")
+            elif nxt.isascii():
+                out.append(c + nxt)   # \d \s \( など
+            else:
+                out.append(_fold_pattern_char(nxt, in_class))
+            i += 2
+            continue
+        if not c.isascii():
+            out.append(_fold_pattern_char(c, in_class))
+        elif in_class:
+            if c == "]" and i > class_start:
+                in_class = False
+            out.append("ー" if c == "~" else c)
+        elif c == "[":
+            in_class = True
+            class_start = i + 1
+            if pattern[i + 1:i + 2] == "^":
+                class_start += 1
+                out.append("[^")
+                i += 2
+                continue
+            out.append(c)
+        else:
+            out.append("ー" if c in "-~" else c)
+        i += 1
+    return "".join(out)
+
+
+def compile_patterns(terms: list[str], fuzzy: bool) -> list[re.Pattern]:
+    """
+    正規表現の検索語をコンパイルする（大文字小文字は無視）。fuzzy なら表記ゆれも無視する
+    （fold_text したテキストに当てる）。書き方が正しくなければ re.error。
+    """
+    return [re.compile(fold_pattern(t) if fuzzy else t, re.IGNORECASE) for t in terms if t]
+
+
+def regex_error(terms: list[str], fuzzy: bool) -> str | None:
+    """正規表現の検索語に書き方の誤りがあれば、その説明（日本語＋元の英語）を返す。"""
+    for term in terms:
+        try:
+            re.compile(term)
+            compile_patterns([term], fuzzy)
+        except re.error as exc:
+            where = f"（{exc.pos + 1} 文字目付近）" if exc.pos is not None else ""
+            return (f"「{term}」を正規表現として読めませんでした{where}。\n{exc.msg}\n\n"
+                    "( ) [ ] などの記号をそのまま探すときは、前に \\ を付けてください（例: \\(笑\\)）。")
+    return None
+
+
+def find_terms(text: str, terms: list[str], fuzzy: bool,
+               regex: bool = False) -> list[tuple[int, int]]:
     """text 中に現れる各検索語の位置 (開始, 終了) をすべて返す（元の文字位置）。"""
     if fuzzy:
         hay, origin = fold_with_map(text)
-        needles = [fold_text(t) for t in terms]
     else:
-        hay, origin = text.lower(), list(range(len(text)))
-        needles = [t.lower() for t in terms]
+        hay, origin = (text if regex else text.lower()), list(range(len(text)))
     spans = []
+    if regex:
+        for pattern in compile_patterns(terms, fuzzy):
+            for m in pattern.finditer(hay):
+                if m.end() > m.start():   # 長さ 0 の一致（a* など）は強調しない
+                    spans.append((origin[m.start()], origin[m.end() - 1] + 1))
+        return sorted(spans)
+    needles = [fold_text(t) for t in terms] if fuzzy else [t.lower() for t in terms]
     for needle in needles:
         if not needle:
             continue
@@ -485,7 +566,10 @@ def find_terms(text: str, terms: list[str], fuzzy: bool) -> list[tuple[int, int]
     return sorted(spans)
 
 
-def contains_any(text: str, terms: list[str], fuzzy: bool) -> bool:
+def contains_any(text: str, terms: list[str], fuzzy: bool, regex: bool = False) -> bool:
+    if regex:
+        hay = fold_text(text) if fuzzy else text
+        return any(p.search(hay) for p in compile_patterns(terms, fuzzy))
     if fuzzy:
         folded = fold_text(text)
         return any(fold_text(t) and fold_text(t) in folded for t in terms)
@@ -1283,14 +1367,29 @@ class TextIndex:
         return f"%{esc}%"
 
     def search(self, terms: list[str], fuzzy: bool = False,
-               exclude: list[str] | None = None) -> list[tuple[str, str]]:
+               exclude: list[str] | None = None, regex: bool = False) -> list[tuple[str, str]]:
         """
         全 term を含み（AND・部分一致・大文字小文字無視）、exclude のどれも含まない画像を
         [(relpath, text), ...] で返す。exclude だけなら、それを含まない全ページ。
         terms も exclude も空なら空リスト。
         fuzzy=True なら表記ゆれを吸収して比べる（fold_text）。
+        regex=True なら各語を正規表現として探す（書き方が正しくなければ re.error）。
         """
         exclude = exclude or []
+        if regex:
+            include_p = compile_patterns(terms, fuzzy)
+            exclude_p = compile_patterns(exclude, fuzzy)
+            if not include_p and not exclude_p:
+                return []
+            with self._connect() as conn:
+                rows = conn.execute("SELECT relpath, text, norm FROM images").fetchall()
+            hits = []
+            for relpath, text, norm in rows:
+                hay = (norm if fuzzy else text) or ""
+                if (all(p.search(hay) for p in include_p)
+                        and not any(p.search(hay) for p in exclude_p)):
+                    hits.append((relpath, text))
+            return sorted(hits, key=lambda r: _natural_sort_key(r[0]))
         if fuzzy:
             terms = [fold_text(t) for t in terms]
             exclude = [fold_text(t) for t in exclude]
@@ -1309,10 +1408,10 @@ class TextIndex:
         return sorted(rows, key=lambda r: _natural_sort_key(r[0]))
 
 
-def make_snippet(text: str, terms: list[str], fuzzy: bool = False) -> str:
+def make_snippet(text: str, terms: list[str], fuzzy: bool = False, regex: bool = False) -> str:
     """ヒット語の周辺を抜き出した1行スニペットを作る。"""
     flat = re.sub(r"\s+", " ", text).strip()
-    spans = find_terms(flat, terms, fuzzy)
+    spans = find_terms(flat, terms, fuzzy, regex)
     if not spans:
         return flat[:80] + ("…" if len(flat) > 80 else "")
     pos, end_hit = spans[0]
@@ -2117,10 +2216,11 @@ EXPORT_FORMATS = {".csv": "csv", ".json": "json", ".txt": "txt"}
 
 def export_results(path: Path, rows: list[dict], *, folder: Path | list[Path],
                    terms: list[str] | None = None, exclude: list[str] | None = None,
-                   fuzzy: bool = True) -> int:
+                   fuzzy: bool = True, regex: bool = False) -> int:
     """
     登録内容（TextIndex.export_rows）を path の拡張子の形式で書き出し、件数を返す。
     terms・exclude（除いた語）を渡すと検索結果として書き出す（ヒット箇所の列・検索条件が付く）。
+    regex は正規表現で検索した結果か（ヒット箇所の抜き出しと、書き出す検索条件に使う）。
     folder に複数のフォルダを渡すと（複数の索引をまとめて検索した結果）、各行の
     "title"（索引のタイトル）と "folder"（そのページの対象フォルダ）も書き出す。
       CSV  … Excel 向け。1 ページ 1 行。UTF-8（BOM 付き。Excel で文字化けしない）
@@ -2142,7 +2242,7 @@ def export_results(path: Path, rows: list[dict], *, folder: Path | list[Path],
             "name": PurePosixPath(member).name if member else Path(outer).name,
             "archive": Path(outer).name if member else "",
             "location": display_path(row["relpath"]),
-            "snippet": make_snippet(row["text"], terms, fuzzy) if searched else "",
+            "snippet": make_snippet(row["text"], terms, fuzzy, regex) if searched else "",
             **row,
             "folder": str(row.get("folder") or folders[0]),
             "title": row.get("title") or Path(row.get("folder") or folders[0]).name,
@@ -2166,8 +2266,8 @@ def export_results(path: Path, rows: list[dict], *, folder: Path | list[Path],
             "exported_at": exported_at,
             # 複数の索引をまとめて検索した結果なら、フォルダの一覧（各ページの folder も付く）
             "folder": [str(f) for f in folders] if multi else str(folders[0]),
-            "search": ({"terms": terms, "exclude": exclude, "ignore_variants": fuzzy}
-                       if searched else None),
+            "search": ({"terms": terms, "exclude": exclude, "ignore_variants": fuzzy,
+                        "regex": regex} if searched else None),
             "count": len(items),
             "items": [{
                 **({"title": it["title"], "folder": it["folder"]} if multi else {}),
@@ -2184,7 +2284,8 @@ def export_results(path: Path, rows: list[dict], *, folder: Path | list[Path],
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     else:
-        title = (f"検索結果: {format_query(terms, exclude)}（{len(items)} 件）" if searched
+        title = (f"検索結果{'（正規表現）' if regex else ''}: "
+                 f"{format_query(terms, exclude)}（{len(items)} 件）" if searched
                  else f"索引全体（{len(items)} 件）")
         out = [f"KomaSagashi v{__version__} 書き出し",
                *(f"対象フォルダ: {f}" for f in folders), title,
@@ -2681,6 +2782,7 @@ class ImageSearchApp:
         self._last_exclude: list[str] = []   # -語 / !語 で除いた語
         self._last_targets: list[IndexInfo] = []   # 最後に検索した索引
         self._last_fuzzy = True
+        self._last_regex = False
         save_dir = self._settings.get("last_save_dir")
         self._last_save_dir: Path | None = Path(save_dir) if save_dir else None
         scale = self._settings.get("output_scale", 1.0)
@@ -2864,6 +2966,10 @@ class ImageSearchApp:
         self._fuzzy_var = tk.BooleanVar(value=bool(self._settings.get("fuzzy_search", True)))
         ttk.Checkbutton(f, text="表記ゆれを無視", variable=self._fuzzy_var,
                         command=self._on_fuzzy_changed).pack(side="left", padx=(8, 0))
+        # 各語を正規表現として探す（既定は OFF。起動するたびに OFF に戻る）
+        self._regex_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="正規表現", variable=self._regex_var,
+                        command=self._on_regex_changed).pack(side="left", padx=(8, 0))
         self._hit_var = tk.StringVar(value="")
         ttk.Label(f, textvariable=self._hit_var, width=14, anchor="e").pack(side="left", padx=4)
         self._export_hits_btn = ttk.Button(f, text="検索結果を書き出す…",
@@ -3454,14 +3560,23 @@ class ImageSearchApp:
         targets = self._search_targets()
         terms, exclude = parse_query(self._query_var.get())   # -語 / !語 は除く
         fuzzy = bool(self._fuzzy_var.get())
-        self._last_terms, self._last_exclude, self._last_fuzzy = terms, exclude, fuzzy
+        regex = bool(self._regex_var.get())
         self._clear_results()
+        self._last_terms, self._last_exclude = [], []   # 書き方の誤りで検索しなかったときは強調もしない
         self._last_targets = targets
         multi = len(targets) > 1
         self._tree["displaycolumns"] = ("title", "file", "snippet") if multi else ("file", "snippet")
 
         if not terms and not exclude:
             return
+        if regex and (error := regex_error(terms + exclude, fuzzy)):
+            if quiet:
+                self._hit_var.set("正規表現の誤り")
+            else:
+                messagebox.showerror("正規表現の書き方が正しくありません", error)
+            return
+        self._last_terms, self._last_exclude = terms, exclude
+        self._last_fuzzy, self._last_regex = fuzzy, regex
         if not targets:
             if quiet:
                 pass
@@ -3478,14 +3593,15 @@ class ImageSearchApp:
             if not index.exists():
                 continue   # 検索タブを作り直す前に消えた索引
             try:
-                rows = index.search(terms, fuzzy=fuzzy, exclude=exclude)
-            except sqlite3.Error as exc:
+                rows = index.search(terms, fuzzy=fuzzy, exclude=exclude, regex=regex)
+            except (sqlite3.Error, re.error) as exc:
                 messagebox.showerror("エラー", f"検索に失敗しました（{info.title}）:\n{exc}")
                 return
             for relpath, text in rows:
                 iid = self._tree.insert(
                     "", "end",
-                    values=(display_name(relpath), make_snippet(text, terms, fuzzy), info.title))
+                    values=(display_name(relpath), make_snippet(text, terms, fuzzy, regex),
+                            info.title))
                 self._result_map[iid] = (index.root, text, relpath)
             total += len(rows)
 
@@ -3520,7 +3636,8 @@ class ImageSearchApp:
                    terms: list[str] | None, exclude: list[str] | None = None) -> None:
         try:
             n = export_results(path, rows, folder=folder, terms=terms,
-                               exclude=exclude, fuzzy=self._last_fuzzy)
+                               exclude=exclude, fuzzy=self._last_fuzzy,
+                               regex=self._last_regex)
         except Exception as exc:
             messagebox.showerror("エラー", f"書き出せませんでした:\n{exc}")
             return
@@ -3577,6 +3694,10 @@ class ImageSearchApp:
 
     def _on_fuzzy_changed(self) -> None:
         self._settings.set("fuzzy_search", bool(self._fuzzy_var.get()))
+        if self._query_var.get().strip():
+            self._run_search(quiet=True)
+
+    def _on_regex_changed(self) -> None:
         if self._query_var.get().strip():
             self._run_search(quiet=True)
 
@@ -3707,7 +3828,7 @@ class ImageSearchApp:
         hits: list[Box] = []
         if blocks is not None:
             hits = [box for box, btext in blocks
-                    if contains_any(btext, self._last_terms, self._last_fuzzy)]
+                    if contains_any(btext, self._last_terms, self._last_fuzzy, self._last_regex)]
         selection = pick_panel(panels, hits[0], img.size) if hits else None
         self._canvas.show(img, panels, hits, selection)
         self._crop_hint_var.set(
@@ -3719,7 +3840,7 @@ class ImageSearchApp:
         self._fulltext.delete("1.0", "end")
         self._fulltext.insert("1.0", text)
         # ヒット語を全てハイライト（表記ゆれを無視した検索なら、ゆれた表記も強調する）
-        for start, end in find_terms(text, self._last_terms, self._last_fuzzy):
+        for start, end in find_terms(text, self._last_terms, self._last_fuzzy, self._last_regex):
             self._fulltext.tag_add("hit", f"1.0+{start}c", f"1.0+{end}c")
         self._fulltext.config(state="disabled")
 
